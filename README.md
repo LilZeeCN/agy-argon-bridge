@@ -30,14 +30,16 @@ python3 bin/verify_argon.py
 
 工具调用还应单独验证，例如让 AGY 读取一个包含随机文本的本地文件，并核对返回内容。文本生成通过，不等于所有工具、图片或视频行为均已验证。
 
+2026-10-14 已用原版 AGY 1.3.5 完成 17 项真实功能测试，包括 Skill 自动触发、`/技能名` 手动调用、参考文件读取与附带脚本执行。逐项结果、测试版本及未覆盖范围见 [兼容性验证记录](docs/compatibility.md)。
+
 ## 路由与配置
 
 - Gemini 文本和辅助文本请求映射到 Argon；图片模型请求保留原模型，使用同一 Vertex AI 项目，是否可调用取决于该模型在项目中的可用性。
 - 保留 `tools`、`toolConfig`、`systemInstruction`、`safetySettings`，以及 SDK 支持的生成配置，包括 `thinkingConfig`、`responseMimeType` 和 schema。
-- Argon 支持 LOW、MEDIUM、HIGH。旧客户端传入 MINIMAL 时转换为 LOW；旧的 `thinkingBudget` 被移除，未给出明确级别时使用 Argon 默认 MEDIUM。原本的预算数值不等于新的推理级别。
+- Argon 支持 LOW、MEDIUM、HIGH。实际 AGY 1.3.5 会将这三个级别表示为旧预算 1000、4000、-1，桥接器将它们映射回对应级别；明确的 `thinkingLevel` 优先，MINIMAL 转换为 LOW。其他旧预算被移除并使用 Argon 默认 MEDIUM。原本的预算数值不等于新的推理级别。
 - Argon 忽略 temperature、topP 和 topK，桥接器会移除这三个无效参数。
 - 异步云端请求设有 120 秒网络超时，不阻塞健康检查。客户端断开会关闭流；首帧前的上游错误保留 HTTP 状态码，首帧后的错误只能通过 SSE 报告。
-- 签名字节经 SDK JSON 序列化可能成为 URL-Safe Base64；响应转换为 Go 客户端支持的标准 Base64，保留签名原始字节。
+- 签名与图片字节经 SDK JSON 序列化可能成为 URL-Safe Base64；`thoughtSignature` 和 `inlineData.data` 转换为 Go 客户端支持的标准 Base64，保留原始字节，不修改工具参数中的普通 `data` 字段。
 
 ## 计费与赠金证据
 
@@ -80,7 +82,7 @@ python3 -m venv .venv
 bash -n install.sh uninstall.sh bin/agy-argon
 ```
 
-回归覆盖并发健康检查、图片路由、系统/工具 token 计算、上游错误状态、签名字节往返、生成配置及项目解析。真实云端调用与账单抵扣需独立核验。
+回归覆盖并发健康检查、图片路由和字节编码、系统/工具 token 计算、上游错误状态、签名字节往返、推理级别映射、生成配置及项目解析。真实云端调用与账单抵扣需独立核验。
 
 运行 `./uninstall.sh` 可移除 macOS 服务和安装文件；按脚本提示移除 shell alias。自行启动的独立进程需要先停止。
 
