@@ -58,11 +58,37 @@ class ConfigTests(unittest.TestCase):
         cfg = bridge.build_config({"generationConfig": {"thinkingConfig": {"thinkingLevel": "MINIMAL"}}})
         self.assertEqual(cfg.thinking_config.thinking_level, "LOW")
 
+    def test_agy_effort_budgets_preserve_reasoning_levels(self):
+        # 实际 AGY 1.3.5 请求：LOW=1000、MEDIUM=4000、HIGH=-1。
+        for budget, level in [(1000, "LOW"), (4000, "MEDIUM"), (-1, "HIGH")]:
+            with self.subTest(budget=budget):
+                cfg = bridge.build_config({"generationConfig": {"thinkingConfig": {"thinkingBudget": budget}}})
+                self.assertEqual(cfg.thinking_config.thinking_level, level)
+
+    def test_explicit_reasoning_level_wins_over_legacy_budget(self):
+        cfg = bridge.build_config({"generationConfig": {"thinkingConfig": {"thinkingBudget": 1000, "thinkingLevel": "HIGH"}}})
+        self.assertEqual(cfg.thinking_config.thinking_level, "HIGH")
+
     def test_signature_roundtrip_preserves_bytes(self):
         raw = b"\xfb\xef\xff\x00\x01"
         cleaned = bridge.sanitize_chunk({"thoughtSignature": base64.urlsafe_b64encode(raw).decode().rstrip("=")})
         part = types.Part.model_validate(cleaned)
         self.assertEqual(part.thought_signature, raw)
+
+    def test_inline_media_uses_standard_base64_without_changing_tool_data(self):
+        raw = b"\xfb\xef\xff\x00\x01"
+        response = types.GenerateContentResponse(candidates=[types.Candidate(content=types.Content(parts=[
+            types.Part(inline_data=types.Blob(data=raw, mime_type="image/png")),
+            types.Part(function_call=types.FunctionCall(name="fixture", args={"data": "keep-me_-"})),
+        ]))])
+        for data in [bridge.response_dict(response, "fixture-image", "fixture-image"),
+                     bridge.sanitize_chunk({"candidates": [{"content": {"parts": [{"inlineData": {
+                         "data": base64.urlsafe_b64encode(raw).decode().rstrip("="), "mimeType": "image/png"
+                     }}]}}]})]:
+            encoded = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+            self.assertEqual(base64.b64decode(encoded, validate=True), raw)
+        self.assertEqual(bridge.response_dict(response, "fixture-image", "fixture-image")
+                         ["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["data"], "keep-me_-")
 
     def test_no_author_project_fallback(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(bridge.subprocess, "run", side_effect=FileNotFoundError), \

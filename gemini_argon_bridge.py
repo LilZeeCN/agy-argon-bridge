@@ -22,7 +22,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = "gemini-4-argon"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 last_response = None
 
 @asynccontextmanager
@@ -82,8 +82,8 @@ def sanitize_chunk(obj):
     字段反序列化时，仅接受标准 Base64 格式 (含 '+' 和 '/')，否则会直接抛出：
     `json: cannot unmarshal string into Go struct field ... illegal base64 data at input byte 6`。
     
-    本函数自动将所有层级的 `thoughtSignature` 补齐合法 padding 并转为标准 Base64 编码，
-    彻底保障本地工具调用的顺畅回传。
+    本函数将 `thoughtSignature` 与 `inlineData.data` 补齐 padding 并转为标准 Base64，
+    保留原始字节，兼容工具调用与图片生成回传。
     """
     if isinstance(obj, dict):
         new_dict = {}
@@ -97,6 +97,13 @@ def sanitize_chunk(obj):
                     except Exception as e:
                         print(f"[WARN] Failed to convert thoughtSignature: {e}", file=sys.stderr)
                         pass
+            elif k == "inlineData" and isinstance(v, dict):
+                blob = sanitize_chunk(v)
+                encoded = blob.get("data")
+                if isinstance(encoded, str) and encoded:
+                    padded = encoded + "=" * (-len(encoded) % 4)
+                    blob["data"] = base64.b64encode(base64.urlsafe_b64decode(padded)).decode("ascii")
+                new_dict[k] = blob
             else:
                 new_dict[k] = sanitize_chunk(v)
         return new_dict
@@ -166,8 +173,11 @@ def build_config(body: dict, model: str = TARGET_MODEL) -> types.GenerateContent
 
     cfg = types.GenerateContentConfig.model_validate(config_args)
     if model == TARGET_MODEL:
-        # Argon 不支持旧模型的 token 推理预算；保留明确级别，旧预算使用默认 MEDIUM。
+        # AGY 1.3.5 的 LOW/MEDIUM/HIGH 分别编码为 1000/4000/-1。
         if cfg.thinking_config:
+            budget = cfg.thinking_config.thinking_budget
+            if cfg.thinking_config.thinking_level is None:
+                cfg.thinking_config.thinking_level = {1000: "LOW", 4000: "MEDIUM", -1: "HIGH"}.get(budget)
             cfg.thinking_config.thinking_budget = None
             if cfg.thinking_config.thinking_level == "MINIMAL":
                 cfg.thinking_config.thinking_level = "LOW"
