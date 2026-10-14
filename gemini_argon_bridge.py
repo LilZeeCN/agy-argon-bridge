@@ -8,19 +8,35 @@ License: MIT
 import os
 import sys
 import json
-import time
 import base64
 import subprocess
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import google.auth
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 from google import genai
 from google.genai import types
+from pydantic import ValidationError
+
+TARGET_MODEL = "gemini-4-argon"
+VERSION = "1.1.0"
+last_response = None
+
+@asynccontextmanager
+async def lifespan(app):
+    try:
+        yield
+    finally:
+        await client.aio.aclose()
 
 app = FastAPI(
     title="Antigravity Gemini 4 Argon Bridge",
     description="Bridge Antigravity CLI to Google Cloud Vertex AI Gemini 4 Argon with Full Tool Calling Support",
-    version="1.0.0",
+    version=VERSION,
+    lifespan=lifespan,
 )
 
 def get_default_project_id() -> str:
@@ -39,8 +55,11 @@ def get_default_project_id() -> str:
             return res.stdout.strip()
     except Exception:
         pass
-    # 默认 fallback
-    return "gen-lang-client-0567634324"
+    credentials, project = google.auth.default()
+    project = project or credentials.quota_project_id
+    if project:
+        return project
+    raise RuntimeError("无法确定 Google Cloud 项目，请设置 GOOGLE_CLOUD_PROJECT 后重新安装。")
 
 PROJECT_ID = get_default_project_id()
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
@@ -50,6 +69,7 @@ client = genai.Client(
     vertexai=True,
     project=PROJECT_ID,
     location=LOCATION,
+    http_options=types.HttpOptions(timeout=120000),
 )
 
 def sanitize_chunk(obj):
@@ -57,7 +77,7 @@ def sanitize_chunk(obj):
     核心兼容层：清洗响应数据，确保符合 Go 语言客户端 (agy) 的反序列化要求。
     
     【关键痛点与原理】：
-    Vertex AI 返回的 `thoughtSignature` 采用 RFC 4648 URL-Safe Base64 编码 (含 '-' 和 '_')。
+    SDK 的 JSON 序列化可能将 `thoughtSignature` 表示为 URL-Safe Base64 (含 '-' 和 '_')。
     而 Antigravity CLI 客户端采用 Go 语言实现，Go 标准库 `json.Unmarshal` 对 `[]uint8` ([]byte)
     字段反序列化时，仅接受标准 Base64 格式 (含 '+' 和 '/')，否则会直接抛出：
     `json: cannot unmarshal string into Go struct field ... illegal base64 data at input byte 6`。
@@ -88,10 +108,13 @@ def sanitize_chunk(obj):
 @app.get("/healthz")
 async def healthz():
     return {
-        "status": "ok",
-        "model": "gemini-4-argon",
+        "status": "ready",
+        "bridge": "agy-argon-bridge",
+        "version": VERSION,
+        "model": TARGET_MODEL,
         "project": PROJECT_ID,
         "location": LOCATION,
+        "last_response": last_response,
     }
 
 @app.get("/v1beta/models")
@@ -118,8 +141,8 @@ async def list_models():
         ]
     }
 
-def build_config(body: dict) -> types.GenerateContentConfig:
-    config_args = {}
+def build_config(body: dict, model: str = TARGET_MODEL) -> types.GenerateContentConfig:
+    config_args = dict(body.get("generationConfig") or body.get("generation_config") or {})
 
     # 1. 保留客户端注入的系统角色与工作流指令
     sys_inst = body.get("systemInstruction") or body.get("system_instruction")
@@ -141,24 +164,49 @@ def build_config(body: dict) -> types.GenerateContentConfig:
     if safety:
         config_args["safety_settings"] = safety
 
-    # 5. 生成配置
-    gen_cfg = body.get("generationConfig", {})
-    if "temperature" in gen_cfg:
-        config_args["temperature"] = gen_cfg["temperature"]
-    if "topP" in gen_cfg:
-        config_args["top_p"] = gen_cfg["topP"]
-    if "topK" in gen_cfg:
-        config_args["top_k"] = gen_cfg["topK"]
-    if "maxOutputTokens" in gen_cfg:
-        config_args["max_output_tokens"] = gen_cfg["maxOutputTokens"]
-    if "stopSequences" in gen_cfg:
-        config_args["stop_sequences"] = gen_cfg["stopSequences"]
+    cfg = types.GenerateContentConfig.model_validate(config_args)
+    if model == TARGET_MODEL:
+        # Argon 不支持旧模型的 token 推理预算；保留明确级别，旧预算使用默认 MEDIUM。
+        if cfg.thinking_config:
+            cfg.thinking_config.thinking_budget = None
+            if cfg.thinking_config.thinking_level == "MINIMAL":
+                cfg.thinking_config.thinking_level = "LOW"
+        cfg.temperature = cfg.top_p = cfg.top_k = None
+    return cfg
 
-    return types.GenerateContentConfig(**config_args)
+def response_dict(response, requested_model, upstream_model):
+    global last_response
+    data = response.model_dump(by_alias=True, mode="json", exclude_none=True)
+    data.pop("sdkHttpResponse", None)
+    if data.get("modelVersion"):
+        last_response = {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "requested_model": requested_model,
+            "upstream_model": upstream_model,
+            "modelVersion": data["modelVersion"],
+            "responseId": data.get("responseId"),
+        }
+        if data.get("usageMetadata"):
+            last_response["usageMetadata"] = data["usageMetadata"]
+        print(json.dumps({"event": "upstream_response", **last_response}), flush=True)
+    return sanitize_chunk(data)
+
+def upstream_error(exc):
+    code = getattr(exc, "code", 500)
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        code = 504
+    if not isinstance(code, int) or not 400 <= code <= 599:
+        code = 502
+    return JSONResponse(status_code=code, content={"error": {"message": str(exc), "code": code}})
 
 @app.post("/v1beta/models/{model_path:path}")
 @app.post("/v1/models/{model_path:path}")
 async def handle_model_request(model_path: str, request: Request):
+    requested_model, separator, operation = model_path.rpartition(":")
+    if not separator or operation not in {"countTokens", "generateContent", "streamGenerateContent"}:
+        return JSONResponse(status_code=404, content={"error": {"message": "Unsupported model operation"}})
+    # 图片模型保留原模型，其余 Gemini 文本请求映射到 Argon。
+    upstream_model = requested_model if "image" in requested_model else TARGET_MODEL
     body = await request.json()
     raw_contents = body.get("contents", [])
     
@@ -175,59 +223,69 @@ async def handle_model_request(model_path: str, request: Request):
     print(f"Path: {model_path}")
     print(f"Has Local Tools: {has_tools} (Declarations count: {len(body.get('tools', []))})")
     print(f"Contents count: {len(parsed_contents)}")
-    print(f"Routing -> Google Cloud Vertex AI (gemini-4-argon)")
+    print(f"Routing -> Google Cloud Vertex AI ({upstream_model})", flush=True)
     print(f"=======================================================\n")
 
     # 1. 处理 Token 计算
-    if ":countTokens" in model_path:
+    if operation == "countTokens":
         try:
-            res = client.models.count_tokens(
-                model="gemini-4-argon",
+            res = await client.aio.models.count_tokens(
+                model=upstream_model,
                 contents=parsed_contents,
+                config=types.CountTokensConfig(
+                    system_instruction=body.get("systemInstruction") or body.get("system_instruction"),
+                    tools=body.get("tools"),
+                ),
             )
             return JSONResponse(content={"totalTokens": res.total_tokens})
         except Exception as e:
-            return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
+            return upstream_error(e)
 
-    cfg = build_config(body)
-    is_stream = ":streamGenerateContent" in model_path
+    try:
+        cfg = build_config(body, upstream_model)
+    except ValidationError as e:
+        return JSONResponse(status_code=400, content={"error": {"message": str(e), "code": 400}})
+    is_stream = operation == "streamGenerateContent"
 
     # 2. 处理流式输出 (流式返回并实施 Base64 清洗)
     if is_stream:
+        # 在发送 HTTP 200 前取得首帧，鉴权、配额和网络失败保留正确状态码。
+        try:
+            response_stream = await client.aio.models.generate_content_stream(
+                model=upstream_model, contents=parsed_contents, config=cfg,
+            )
+            first_chunk = await anext(response_stream)
+        except Exception as e:
+            return upstream_error(e)
+
         async def event_generator():
             try:
-                response_stream = client.models.generate_content_stream(
-                    model="gemini-4-argon",
-                    contents=parsed_contents,
-                    config=cfg,
-                )
-                for chunk in response_stream:
-                    chunk_dict = chunk.model_dump(by_alias=True, mode="json", exclude_none=True)
-                    chunk_dict.pop("sdkHttpResponse", None)
-                    chunk_dict = sanitize_chunk(chunk_dict)
+                yield f"data: {json.dumps(response_dict(first_chunk, requested_model, upstream_model))}\n\n"
+                async for chunk in response_stream:
+                    chunk_dict = response_dict(chunk, requested_model, upstream_model)
                     yield f"data: {json.dumps(chunk_dict)}\n\n"
             except Exception as e:
-                print(f"Streaming error on gemini-4-argon: {e}", file=sys.stderr)
+                print(f"Streaming error on {upstream_model}: {e}", file=sys.stderr)
                 err_dict = {"error": {"message": str(e), "code": 500}}
                 yield f"data: {json.dumps(err_dict)}\n\n"
+            finally:
+                await response_stream.aclose()
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     # 3. 处理非流式输出
     else:
         try:
-            resp = client.models.generate_content(
-                model="gemini-4-argon",
+            resp = await client.aio.models.generate_content(
+                model=upstream_model,
                 contents=parsed_contents,
                 config=cfg,
             )
-            resp_dict = resp.model_dump(by_alias=True, mode="json", exclude_none=True)
-            resp_dict.pop("sdkHttpResponse", None)
-            resp_dict = sanitize_chunk(resp_dict)
+            resp_dict = response_dict(resp, requested_model, upstream_model)
             return JSONResponse(content=resp_dict)
         except Exception as e:
-            print(f"GenerateContent error on gemini-4-argon: {e}", file=sys.stderr)
-            return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
+            print(f"GenerateContent error on {upstream_model}: {e}", file=sys.stderr)
+            return upstream_error(e)
 
 if __name__ == "__main__":
     port = int(os.environ.get("ARGON_BRIDGE_PORT", 8050))

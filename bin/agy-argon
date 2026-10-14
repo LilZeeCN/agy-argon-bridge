@@ -1,36 +1,72 @@
 #!/usr/bin/env bash
 # ==============================================================================
+set -euo pipefail
 # agy-argon: Antigravity CLI Launcher with Vertex AI Gemini 4 Argon Backend
 # ==============================================================================
 
-PORT="${ARGON_BRIDGE_PORT:-8050}"
 BRIDGE_DIR="$HOME/.local/share/agy-argon"
 BRIDGE_SCRIPT="$BRIDGE_DIR/gemini_argon_bridge.py"
 LOG_FILE="$BRIDGE_DIR/bridge.log"
+CONFIG_FILE="$BRIDGE_DIR/config.env"
+CONFIG_PORT=""
+if [ -f "$CONFIG_FILE" ]; then
+    # 保留本次命令显式指定的端口、项目和区域。
+    SAVED_PORT="${ARGON_BRIDGE_PORT:-}"
+    SAVED_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
+    SAVED_LOCATION="${GOOGLE_CLOUD_LOCATION:-}"
+    source "$CONFIG_FILE"
+    CONFIG_PORT="${ARGON_BRIDGE_PORT:-8050}"
+    [ -z "$SAVED_PORT" ] || export ARGON_BRIDGE_PORT="$SAVED_PORT"
+    [ -z "$SAVED_PROJECT" ] || export GOOGLE_CLOUD_PROJECT="$SAVED_PROJECT"
+    [ -z "$SAVED_LOCATION" ] || export GOOGLE_CLOUD_LOCATION="$SAVED_LOCATION"
+fi
+PORT="${ARGON_BRIDGE_PORT:-8050}"
+PYTHON_BIN="$BRIDGE_DIR/venv/bin/python"
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "桥接运行环境不存在，请重新运行 install.sh。" >&2
+    exit 1
+fi
+
+health_check() {
+    curl --noproxy '*' --fail --silent --max-time 2 "http://127.0.0.1:$PORT/healthz" |
+        "$PYTHON_BIN" -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("bridge")=="agy-argon-bridge" and d.get("status")=="ready" and d.get("version")=="1.1.0" else 1)' 2>/dev/null
+}
 
 # 检测本地桥接服务是否正常存活
+STARTING=false
 if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
-    echo "⚡ 正在唤醒后台 Gemini 4 Argon 桥接服务 (Port: $PORT)..."
-    mkdir -p "$BRIDGE_DIR"
-    
-    # 查找可用 python3
-    PYTHON_BIN="$(which python3)"
-    if [ -f "$HOME/miniconda3/bin/python3" ]; then
-        PYTHON_BIN="$HOME/miniconda3/bin/python3"
+    STARTING=true
+    if [[ "${OSTYPE:-}" == "darwin"* ]] && [ "$PORT" = "$CONFIG_PORT" ] &&
+        launchctl list com.antigravity.argon-bridge >/dev/null 2>&1; then
+        # 已注册的服务可能仍在启动，不与 launchd 抢占同一个端口。
+        launchctl start com.antigravity.argon-bridge
+    else
+        echo "⚡ 正在唤醒后台 Gemini 4 Argon 桥接服务 (Port: $PORT)..."
+        mkdir -p "$BRIDGE_DIR"
+        nohup "$PYTHON_BIN" "$BRIDGE_SCRIPT" > "$LOG_FILE" 2>&1 &
     fi
-    
-    nohup "$PYTHON_BIN" "$BRIDGE_SCRIPT" > "$LOG_FILE" 2>&1 &
-    sleep 1.2
+fi
+
+READY=false
+for _ in {1..30}; do
+    if health_check; then READY=true; break; fi
+    # 新启动的服务须等到健康接口就绪；原有服务失去响应则直接报错。
+    if [ "$STARTING" = false ]; then break; fi
+    sleep 0.2
+done
+if [ "$READY" != true ]; then
+    echo "桥接服务未就绪或端口被其他服务占用：${PORT}。请查看 $BRIDGE_DIR 的日志。" >&2
+    exit 1
 fi
 
 # 注入本地代理环境变量
 export GEMINI_API_KEY="dummy"
 export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:$PORT"
 
-echo "✨ 已接入 Vertex AI 上的 Gemini 4 Argon 模型（全额计入 300$ 赠金）"
+echo "Vertex AI 桥接器已就绪：文本请求路由至 Gemini 4 Argon；赠金抵扣以账单为准。"
 
 # 寻找原版 agy 可执行文件
-AGY_BIN="$(which agy 2>/dev/null)"
+AGY_BIN="$(command -v agy 2>/dev/null || true)"
 if [ "$AGY_BIN" = "$HOME/.local/bin/agy-argon" ] || [ -z "$AGY_BIN" ]; then
     if [ -f "$HOME/.local/bin/agy" ]; then
         AGY_BIN="$HOME/.local/bin/agy"
