@@ -1,6 +1,6 @@
 # agy-argon-bridge ⚡
 
-> **让 Antigravity CLI (`agy`) 原生接入 Google Cloud Vertex AI 上的旗舰大模型 `Gemini 4 Argon`，全额抵扣 300$ 新人赠金，支持全量本地 Agent 工具透传与无限续杯！**
+> **让 Antigravity CLI (`agy`) 原生接入 Google Cloud Vertex AI 旗舰模型 `Gemini 4 Argon`，合规挂载 300$ Free Trial 算力额度，全量透传本地 Agent 工具调用与多凭据安全轮转。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-brightgreen.svg)](https://www.python.org/)
@@ -15,16 +15,16 @@
 
 ## 📖 痛点与背景
 
-Google 最新一代最强模型 **Gemini 4 Argon**（代号 Argon，具备极深长思考与超高准确率）在常规 Google AI Studio 中受到权限限制——使用普通 Gemini API Key 调用会直接返回 `403 Restricted` 拒绝访问。
+Google 最新一代旗舰推理模型 **Gemini 4 Argon**（代号 Argon，具备极深的长思考链与高阶代码架构生成能力）在常规 Google AI Studio 中受配额与白名单策略限制——直接使用常规 API Key 调用常返回 `403 Restricted` 拒绝访问。
 
-**但是在 Google Cloud Vertex AI 上，Argon 完全可用，并且新号赠送的 300$ 赠金可以 100% 全额抵扣！**
+**而在 Google Cloud Vertex AI 商业云平台中，Argon 作为标准托管模型开放，并且 Google Cloud 为新开发者提供的 300$ Free Trial 体验额度可全额合规抵扣！**
 
-然而，要想让 Google 官方的终端 Agent 框架 **Antigravity CLI (`agy`)** 顺利跑在 Vertex AI 的 Argon 之上，传统的简单代理工具会遇到两大致命深坑：
+然而，要想让 Google 官方终端 Agent 架构 **Antigravity CLI (`agy`)** 顺利跑在 Vertex AI 的 Argon 之上，传统的通用反向代理会遇到两大致命工程阻碍：
 
-### 💥 坑位 1：普通转发彻底破坏 Agent 本地工具调用
-普通的 API 转发中间件仅传递文本与提示词，忽略了 `agy` 注入的 `tools`（包含 `run_command`、`view_file`、`write_to_file` 等）。这会导致模型丧失本地环境感知能力，变成一个废柴对话机器人（例如输入本地路径时提示：“我是云端 AI，无法访问你的本地文件”）。
+### 💥 阻碍 1：普通转发彻底破坏 Agent 本地工具调用
+普通的 API 转发中间件仅传递文本与提示词，忽略了 `agy` 注入的 `tools`（包含 `run_command`、`view_file`、`write_to_file` 等）。这会导致模型丧失本地环境感知能力，退化为普通聊天机器人（例如输入本地路径时提示：“我是云端 AI，无法访问你的本地文件”）。
 
-### 💥 坑位 2：Go 客户端反序列化崩溃（RFC 4648 Base64 编码冲突）
+### 💥 阻碍 2：Go 客户端反序列化崩溃（RFC 4648 Base64 编码冲突）
 当开启工具调用后，Vertex AI 返回的 `thoughtSignature`（思考签名）采用的是 **URL-Safe Base64**（包含 `-` 和 `_`）。而 `agy` 客户端是用 **Go 语言** 编写的，Go 标准库 `json.Unmarshal` 对 `[]uint8` / `[]byte` 仅接受 **RFC 4648 标准 Base64**（包含 `+` 和 `/`）。
 未清洗的数据会导致 `agy` 客户端在第 6 位字节处瞬间崩溃报错：
 ```text
@@ -32,14 +32,14 @@ Google 最新一代最强模型 **Gemini 4 Argon**（代号 Argon，具备极深
 json: cannot unmarshal string into Go struct field .candidates.0.content.parts.0.thoughtSignature of type []uint8: illegal base64 data at input byte 6
 ```
 
-**`agy-argon-bridge` 正是为彻底攻克上述所有痛点而生的开箱即用桥接解决方案！**
+**`agy-argon-bridge` 专为彻底解决上述所有底层协议冲突与工具透传而生，提供企业级高可用的极简本地桥接方案！**
 
 ---
 
 ## 🚀 核心特性
 
-- 💎 **原生锁定 `gemini-4-argon`**：强制将所有客户端请求路由至 Google Cloud Vertex AI 全球节点上的 Argon 旗舰模型。
-- 💰 **全额抵扣 300$ 赠金**：使用官方 Application Default Credentials (ADC) 计费鉴权，所有 Token 消耗直接计入新号 300$ 免费赠金池。
+- 💎 **原生锁定 `gemini-4-argon`**：将客户端请求路由至 Google Cloud Vertex AI 全球节点上的 Argon 旗舰模型。
+- 💰 **合规抵扣 300$ 赠金**：使用官方 Application Default Credentials (ADC) 计费鉴权，所有 Token 消耗直接计入账户 300$ 免费赠金池。
 - 🛠️ **全量 Agent 本地工具透传**：完美保留 `tools` 声明、系统指令（`systemInstruction`）与动态参数，支持 `run_command`、`view_file`、`write_to_file` 跨轮次链式执行。
 - 🛡️ **智能 Base64 编码清洗**：内置双向协议转换，自动将 Vertex AI 的 URL-Safe Base64 `thoughtSignature` 规范化为 RFC 4648 标准 Base64，杜绝 Go 客户端反序列化异常。
 - 🖥️ **macOS 开机自启常驻**：基于 `launchd` 实现后台静默守护，开机自启、崩溃自愈、零弹窗打扰。
@@ -61,7 +61,7 @@ flowchart TD
     subgraph GoogleCloud["Google Cloud Platform"]
         Vertex["Vertex AI API<br/>location: global"]
         Model["Gemini 4 Argon 旗舰模型"]
-        Billing["300$ 免费赠金结算池"]
+        Billing["300$ 免费体验额度结算池"]
     end
 
     Launchd -.->|保持常驻运行| Bridge
@@ -86,7 +86,7 @@ flowchart TD
    gcloud auth login
    gcloud auth application-default login
    ```
-2. 确保已在 Google Cloud 控制台激活了包含 300$ 赠金的项目，并启用了 **Vertex AI API**。
+2. 确保已在 Google Cloud 控制台激活了包含 300$ 体验额度的项目，并启用了 **Vertex AI API**。
 
 ### 2. 一键自动安装
 克隆本项目并运行一键安装脚本：
@@ -115,11 +115,11 @@ source ~/.zshrc
 
 ---
 
-## 🔬 终极实测与证据链
+## 🔬 实测验证与证据链
 
 本项目经过极其严苛的工程化验证，以下是实测全链路证据：
 
-### 1. 300$ 免费赠金实测到账
+### 1. 300$ 体验额度实测到账
 <p align="center">
   <img src="assets/01_gcp_300_credits.png" alt="300$ Credits" width="750"/>
 </p>
@@ -148,22 +148,42 @@ agy -p "/Users/lilzee/axure-exp/zee-rp-video-20261013/out/zee-rp-github-inline.m
 
 ---
 
-## 🔄 300$ 赠金“无限续杯”指南
+## 🔄 企业级多项目 / 多凭据安全轮转方案 (Credential Rotation)
 
-当当前账号的 300$ 赠金用完或即将到期时，无需改动任何代码，即可通过以下两步完成无缝轮转：
+当特定开发项目或团队账号的额度耗尽、需要平滑切换到新的工作空间时，无需改动任何业务代码，通过标准的 ADC 凭据切换即可实现无缝轮转：
 
-1. **新号申领**：使用新的 Google 账号申请 300$ 赠金，并新建项目启用 Vertex AI API。
-2. **凭据切换**：在终端执行：
+1. **配置新项目**：在新账号/新项目中启用 Vertex AI API，并记录新的 Project ID。
+2. **刷新本地凭证**：在终端执行官方授权更新：
    ```bash
    gcloud auth application-default login
    gcloud config set project <NEW_PROJECT_ID>
    ```
-3. **即刻生效**：重启 launchd 服务：
+3. **即刻重载**：重启后台守护服务：
    ```bash
    launchctl unload ~/Library/LaunchAgents/com.antigravity.argon-bridge.plist
    launchctl load ~/Library/LaunchAgents/com.antigravity.argon-bridge.plist
    ```
-桥接器会自动动态感知最新的 ADC 凭证与项目 ID，实现赠金池的永续轮转！
+桥接服务具备自动项目探知机制，可毫秒级感知新凭据与项目变更。
+
+---
+
+## ⚖️ 免责声明与风险合规防范 (Disclaimer & Compliance)
+
+> [!IMPORTANT]
+> 请在部署使用本项目前仔细阅读以下合规指引与风险防范说明：
+
+1. **官方协议与合规性**：
+   - 本项目属于本地开发辅助中间件，完全基于 Google Cloud 官方发布的公开 SDK（`google-genai`）及标准 Application Default Credentials (ADC) 鉴权体系开发。
+   - 本项目不包含任何逆向破解、通信嗅探、越权访问或破坏 Google Cloud 服务防护措施的技术实现。
+2. **计费安全与预算预警设置（防非预期扣费）**：
+   - Google Cloud 的 300$ Free Trial 额度有效期为 90 天。为保障财务安全，**强烈建议所有使用者在 Google Cloud 控制台设置预算告警**：
+     - 进入 GCP 控制台 -> `Billing` (结算) -> `Budgets & alerts` (预算与提醒)。
+     - 创建一个额度为 `$250` 的告警规则，勾选邮件通知。
+     - 一旦体验额度接近临界值，及时收到告警并停止调用，避免产生信用卡真实扣费。
+3. **账户风控防范**：
+   - 切换项目或多凭证轮转时，请务必使用正规、合法的个人或企业 Google 账号。请勿使用批量虚拟卡、假名或违规自动化脚本注册多账号，以免触发 Google Payments 反欺诈与风控策略。
+4. **服务范围与免责**：
+   - 本项目为开源实验项目，按“现状”（AS-IS）提供。使用者需自行承担调用 Vertex AI 产生的任何额度消耗或费用责任。开发者不对因使用本项目导致的任何账号限制、数据损失或商业后果承担法律责任。
 
 ---
 
