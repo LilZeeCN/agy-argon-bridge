@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# agy-argon: Antigravity CLI Launcher with Vertex AI Gemini 4 Argon Backend
+# ==============================================================================
+
+PORT="${ARGON_BRIDGE_PORT:-8050}"
+BRIDGE_DIR="$HOME/.local/share/agy-argon"
+BRIDGE_SCRIPT="$BRIDGE_DIR/gemini_argon_bridge.py"
+LOG_FILE="$BRIDGE_DIR/bridge.log"
+
+# 检测本地桥接服务是否正常存活
+if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+    echo "⚡ 正在唤醒后台 Gemini 4 Argon 桥接服务 (Port: $PORT)..."
+    mkdir -p "$BRIDGE_DIR"
+    
+    # 查找可用 python3
+    PYTHON_BIN="$(which python3)"
+    if [ -f "$HOME/miniconda3/bin/python3" ]; then
+        PYTHON_BIN="$HOME/miniconda3/bin/python3"
+    fi
+    
+    nohup "$PYTHON_BIN" "$BRIDGE_SCRIPT" > "$LOG_FILE" 2>&1 &
+    sleep 1.2
+fi
+
+# 注入本地代理环境变量
+export GEMINI_API_KEY="dummy"
+export GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:$PORT"
+
+echo "✨ 已接入 Vertex AI 上的 Gemini 4 Argon 模型（全额计入 300$ 赠金）"
+
+# 寻找原版 agy 可执行文件
+AGY_BIN="$(which agy 2>/dev/null)"
+if [ "$AGY_BIN" = "$HOME/.local/bin/agy-argon" ] || [ -z "$AGY_BIN" ]; then
+    if [ -f "$HOME/.local/bin/agy" ]; then
+        AGY_BIN="$HOME/.local/bin/agy"
+    elif [ -f "/opt/homebrew/bin/agy" ]; then
+        AGY_BIN="/opt/homebrew/bin/agy"
+    elif [ -f "/usr/local/bin/agy" ]; then
+        AGY_BIN="/usr/local/bin/agy"
+    else
+        AGY_BIN="agy"
+    fi
+fi
+
+exec "$AGY_BIN" "$@"

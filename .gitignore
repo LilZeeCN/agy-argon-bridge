@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Logs
+*.log
+bridge.stdout.log
+bridge.stderr.log
+
+# OS & IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Credentials
+*credentials*.json
+*.key
+.env
