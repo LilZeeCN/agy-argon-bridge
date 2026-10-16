@@ -193,6 +193,8 @@ def build_config(body: dict, model: str = TARGET_MODEL) -> types.GenerateContent
             cfg.thinking_config.thinking_budget = None
             if cfg.thinking_config.thinking_level == "MINIMAL":
                 cfg.thinking_config.thinking_level = "LOW"
+        # 彻底解除客户端可能下发的截断限制，完全释放 Argon 原生 100 万长解码能力
+        cfg.max_output_tokens = None
         cfg.temperature = cfg.top_p = cfg.top_k = None
     return cfg
 
