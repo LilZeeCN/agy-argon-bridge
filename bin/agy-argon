@@ -29,7 +29,7 @@ fi
 
 health_check() {
     curl --noproxy '*' --fail --silent --max-time 2 "http://127.0.0.1:$PORT/healthz" |
-        "$PYTHON_BIN" -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("bridge")=="agy-argon-bridge" and d.get("status")=="ready" and d.get("version")=="1.1.1" else 1)' 2>/dev/null
+        "$PYTHON_BIN" -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("bridge")=="agy-argon-bridge" and d.get("status")=="ready" else 1)' 2>/dev/null
 }
 
 # 检测本地桥接服务是否正常存活

@@ -49,7 +49,7 @@ def get_default_project_id() -> str:
             ["gcloud", "config", "get-value", "project"],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=10,
         )
         if res.returncode == 0 and res.stdout.strip() and "(unset)" not in res.stdout:
             return res.stdout.strip()
@@ -175,11 +175,21 @@ def build_config(body: dict, model: str = TARGET_MODEL) -> types.GenerateContent
 
     cfg = types.GenerateContentConfig.model_validate(config_args)
     if model == TARGET_MODEL:
-        # AGY 1.3.5 的 LOW/MEDIUM/HIGH 分别编码为 1000/4000/-1。
+        # 兼容处理思考强度：将客户端传入的 budget 映射为 Vertex AI 的 thinking_level，防止配置被丢弃
         if cfg.thinking_config:
             budget = cfg.thinking_config.thinking_budget
             if cfg.thinking_config.thinking_level is None:
-                cfg.thinking_config.thinking_level = {1000: "LOW", 4000: "MEDIUM", -1: "HIGH"}.get(budget)
+                if budget is not None:
+                    if budget <= 0:
+                        cfg.thinking_config.thinking_level = "HIGH"
+                    elif budget <= 2000:
+                        cfg.thinking_config.thinking_level = "LOW"
+                    elif budget <= 6000:
+                        cfg.thinking_config.thinking_level = "MEDIUM"
+                    else:
+                        cfg.thinking_config.thinking_level = "HIGH"
+                else:
+                    cfg.thinking_config.thinking_level = "HIGH"
             cfg.thinking_config.thinking_budget = None
             if cfg.thinking_config.thinking_level == "MINIMAL":
                 cfg.thinking_config.thinking_level = "LOW"
@@ -302,4 +312,4 @@ async def handle_model_request(model_path: str, request: Request):
 if __name__ == "__main__":
     port = int(os.environ.get("ARGON_BRIDGE_PORT", 8050))
     print(f"Starting agy-argon-bridge on 127.0.0.1:{port} (Project: {PROJECT_ID})...")
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    uvicorn.run(app, host="127.0.0.1", port=port, timeout_keep_alive=300)
