@@ -64,12 +64,14 @@ def get_default_project_id() -> str:
 PROJECT_ID = get_default_project_id()
 LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
+TIMEOUT_MS = int(os.environ.get("ARGON_BRIDGE_TIMEOUT_MS", 600000))  # 默认 10 分钟 (600,000 ms)
+
 # 初始化 Vertex AI 客户端，使用本机 gcloud ADC 凭据
 client = genai.Client(
     vertexai=True,
     project=PROJECT_ID,
     location=LOCATION,
-    http_options=types.HttpOptions(timeout=120000),
+    http_options=types.HttpOptions(timeout=TIMEOUT_MS),
 )
 
 def sanitize_chunk(obj):
