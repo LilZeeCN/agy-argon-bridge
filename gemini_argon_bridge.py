@@ -23,7 +23,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = "gemini-4-argon"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 last_response = None
 
 @asynccontextmanager
@@ -343,11 +343,9 @@ async def handle_model_request(model_path: str, request: Request):
                     if is_retryable_error(e) and attempt < max_retries:
                         wait_sec = delays[min(attempt, len(delays) - 1)]
                         print(f"\n[RATE_LIMIT_GUARD] Upstream {upstream_model} hit rate limit / temporary error: {e}", flush=True)
-                        print(f"[RATE_LIMIT_GUARD] Entering automatic backoff: waiting {wait_sec}s (retry {attempt + 1}/{max_retries}) with SSE keep-alive...", flush=True)
-                        # 在退避等待期间，每秒发送一条合规的 SSE 注释心跳，保持 TCP 通道活跃并防止 agy 判定断网
-                        for elapsed in range(wait_sec):
-                            await asyncio.sleep(1)
-                            yield f": keep-alive backoff retry={attempt + 1} remaining={wait_sec - elapsed}s\n\n"
+                        print(f"[RATE_LIMIT_GUARD] Entering silent automatic backoff: waiting {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
+                        # agy 的 iterateResponseStream 仅接受 'data: ' 前缀，不可发送 ':' 注释行。静默等待完全受 20 分钟长超时保护。
+                        await asyncio.sleep(wait_sec)
                     else:
                         print(f"Streaming error on {upstream_model}: {e}", file=sys.stderr, flush=True)
                         err_code = getattr(e, "code", 500)
