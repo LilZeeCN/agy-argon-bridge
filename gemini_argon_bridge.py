@@ -10,6 +10,7 @@ import sys
 import json
 import base64
 import subprocess
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import google.auth
@@ -22,7 +23,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = "gemini-4-argon"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 last_response = None
 
 @asynccontextmanager
@@ -34,7 +35,7 @@ async def lifespan(app):
 
 app = FastAPI(
     title="Antigravity Gemini 4 Argon Bridge",
-    description="Bridge Antigravity CLI to Google Cloud Vertex AI Gemini 4 Argon with Full Tool Calling Support",
+    description="Bridge Antigravity CLI to Google Cloud Vertex AI Gemini 4 Argon with Full Tool Calling Support and Resilient Auto-Retry",
     version=VERSION,
     lifespan=lifespan,
 )
@@ -74,18 +75,42 @@ client = genai.Client(
     http_options=types.HttpOptions(timeout=TIMEOUT_MS),
 )
 
+def is_retryable_error(exc: Exception) -> bool:
+    """判断异常是否为可重试的临时性限流或云端超时错误 (429, 503, 504, Timeout)"""
+    code = getattr(exc, "code", None)
+    if code in (429, 503, 504):
+        return True
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError, httpx.NetworkError)):
+        return True
+    err_msg = str(exc).upper()
+    if any(kw in err_msg for kw in ("RESOURCE_EXHAUSTED", "429", "TOO MANY REQUESTS", "DEADLINE_EXCEEDED", "UNAVAILABLE", "TIMEOUT")):
+        return True
+    return False
+
+async def execute_with_backoff(func, *args, max_retries=5, **kwargs):
+    """通用异步重试包装器，处理非流式调用的临时限流与网络抖动"""
+    delays = [5, 10, 15, 25, 40]
+    for attempt in range(max_retries + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if is_retryable_error(e) and attempt < max_retries:
+                wait_sec = delays[min(attempt, len(delays) - 1)]
+                print(f"[RATE_LIMIT_GUARD] Transient error {e}. Backoff {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
+                await asyncio.sleep(wait_sec)
+            else:
+                raise
+
 def sanitize_chunk(obj):
     """
     核心兼容层：清洗响应数据，确保符合 Go 语言客户端 (agy) 的反序列化要求。
     
     【关键痛点与原理】：
-    SDK 的 JSON 序列化可能将 `thoughtSignature` 表示为 URL-Safe Base64 (含 '-' 和 '_')。
-    而 Antigravity CLI 客户端采用 Go 语言实现，Go 标准库 `json.Unmarshal` 对 `[]uint8` ([]byte)
-    字段反序列化时，仅接受标准 Base64 格式 (含 '+' 和 '/')，否则会直接抛出：
-    `json: cannot unmarshal string into Go struct field ... illegal base64 data at input byte 6`。
-    
-    本函数将 `thoughtSignature` 与 `inlineData.data` 补齐 padding 并转为标准 Base64，
-    保留原始字节，兼容工具调用与图片生成回传。
+    1. SDK 的 JSON 序列化可能将 `thoughtSignature` 表示为 URL-Safe Base64 (含 '-' 和 '_')。
+       Go 标准库 `json.Unmarshal` 对 `[]uint8` ([]byte) 字段反序列化时，仅接受标准 Base64 (含 '+' 和 '/')，
+       否则直接抛出 `illegal base64 data at input byte 6`。
+    2. 工具调用 (`functionCall` / `functionResponse`)：
+       确保 `name` 字段存在且优先、`args` 为合法字典，规避 Go 语言 `mapToStruct` 在超大载荷下的结构体映射崩溃。
     """
     if isinstance(obj, dict):
         new_dict = {}
@@ -103,9 +128,36 @@ def sanitize_chunk(obj):
                 blob = sanitize_chunk(v)
                 encoded = blob.get("data")
                 if isinstance(encoded, str) and encoded:
-                    padded = encoded + "=" * (-len(encoded) % 4)
-                    blob["data"] = base64.b64encode(base64.urlsafe_b64decode(padded)).decode("ascii")
+                    try:
+                        padded = encoded + "=" * (-len(encoded) % 4)
+                        blob["data"] = base64.b64encode(base64.urlsafe_b64decode(padded)).decode("ascii")
+                    except Exception as e:
+                        print(f"[WARN] Failed to convert inlineData: {e}", file=sys.stderr)
                 new_dict[k] = blob
+            elif k == "functionCall" and isinstance(v, dict):
+                fc = sanitize_chunk(v)
+                name = fc.get("name")
+                if not isinstance(name, str) or not name:
+                    name = "unknown_tool"
+                args = fc.get("args")
+                if not isinstance(args, dict):
+                    args = {}
+                clean_fc = {"name": name, "args": args}
+                if "id" in fc and fc["id"]:
+                    clean_fc["id"] = str(fc["id"])
+                new_dict[k] = clean_fc
+            elif k == "functionResponse" and isinstance(v, dict):
+                fr = sanitize_chunk(v)
+                name = fr.get("name")
+                if not isinstance(name, str) or not name:
+                    name = "unknown_tool"
+                resp = fr.get("response")
+                if not isinstance(resp, dict):
+                    resp = {}
+                clean_fr = {"name": name, "response": resp}
+                if "id" in fr and fr["id"]:
+                    clean_fr["id"] = str(fr["id"])
+                new_dict[k] = clean_fr
             else:
                 new_dict[k] = sanitize_chunk(v)
         return new_dict
@@ -253,7 +305,8 @@ async def handle_model_request(model_path: str, request: Request):
     # 1. 处理 Token 计算
     if operation == "countTokens":
         try:
-            res = await client.aio.models.count_tokens(
+            res = await execute_with_backoff(
+                client.aio.models.count_tokens,
                 model=upstream_model,
                 contents=parsed_contents,
                 config=types.CountTokensConfig(
@@ -271,36 +324,60 @@ async def handle_model_request(model_path: str, request: Request):
         return JSONResponse(status_code=400, content={"error": {"message": str(e), "code": 400}})
     is_stream = operation == "streamGenerateContent"
 
-    # 2. 处理流式输出 (流式返回并实施 Base64 清洗)
+    # 2. 处理流式输出 (流式返回并实施 Base64 清洗、429 指数退避与 SSE 注释保活)
     if is_stream:
-        # 在发送 HTTP 200 前取得首帧，鉴权、配额和网络失败保留正确状态码。
-        try:
-            response_stream = await client.aio.models.generate_content_stream(
-                model=upstream_model, contents=parsed_contents, config=cfg,
-            )
-            first_chunk = await anext(response_stream)
-        except Exception as e:
-            return upstream_error(e)
-
         async def event_generator():
-            try:
-                yield f"data: {json.dumps(response_dict(first_chunk, requested_model, upstream_model))}\n\n"
-                async for chunk in response_stream:
-                    chunk_dict = response_dict(chunk, requested_model, upstream_model)
-                    yield f"data: {json.dumps(chunk_dict)}\n\n"
-            except Exception as e:
-                print(f"Streaming error on {upstream_model}: {e}", file=sys.stderr)
-                err_dict = {"error": {"message": str(e), "code": 500}}
-                yield f"data: {json.dumps(err_dict)}\n\n"
-            finally:
-                await response_stream.aclose()
+            max_retries = 6
+            delays = [10, 15, 20, 30, 45, 60]  # 阶梯退避宽限长达 3 分钟，彻底消化 GCP 60s TPM 限流窗口
+            response_stream = None
+            first_chunk = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    response_stream = await client.aio.models.generate_content_stream(
+                        model=upstream_model, contents=parsed_contents, config=cfg,
+                    )
+                    first_chunk = await anext(response_stream)
+                    break
+                except Exception as e:
+                    if is_retryable_error(e) and attempt < max_retries:
+                        wait_sec = delays[min(attempt, len(delays) - 1)]
+                        print(f"\n[RATE_LIMIT_GUARD] Upstream {upstream_model} hit rate limit / temporary error: {e}", flush=True)
+                        print(f"[RATE_LIMIT_GUARD] Entering automatic backoff: waiting {wait_sec}s (retry {attempt + 1}/{max_retries}) with SSE keep-alive...", flush=True)
+                        # 在退避等待期间，每秒发送一条合规的 SSE 注释心跳，保持 TCP 通道活跃并防止 agy 判定断网
+                        for elapsed in range(wait_sec):
+                            await asyncio.sleep(1)
+                            yield f": keep-alive backoff retry={attempt + 1} remaining={wait_sec - elapsed}s\n\n"
+                    else:
+                        print(f"Streaming error on {upstream_model}: {e}", file=sys.stderr, flush=True)
+                        err_code = getattr(e, "code", 500)
+                        if not isinstance(err_code, int) or not 400 <= err_code <= 599:
+                            err_code = 502
+                        err_dict = {"error": {"message": str(e), "code": err_code}}
+                        yield f"data: {json.dumps(err_dict)}\n\n"
+                        return
+
+            if response_stream and first_chunk:
+                try:
+                    first_dict = response_dict(first_chunk, requested_model, upstream_model)
+                    yield f"data: {json.dumps(first_dict)}\n\n"
+                    async for chunk in response_stream:
+                        chunk_dict = response_dict(chunk, requested_model, upstream_model)
+                        yield f"data: {json.dumps(chunk_dict)}\n\n"
+                except Exception as e:
+                    print(f"Streaming error during stream iteration on {upstream_model}: {e}", file=sys.stderr, flush=True)
+                    err_dict = {"error": {"message": str(e), "code": 500}}
+                    yield f"data: {json.dumps(err_dict)}\n\n"
+                finally:
+                    await response_stream.aclose()
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     # 3. 处理非流式输出
     else:
         try:
-            resp = await client.aio.models.generate_content(
+            resp = await execute_with_backoff(
+                client.aio.models.generate_content,
                 model=upstream_model,
                 contents=parsed_contents,
                 config=cfg,
@@ -314,4 +391,4 @@ async def handle_model_request(model_path: str, request: Request):
 if __name__ == "__main__":
     port = int(os.environ.get("ARGON_BRIDGE_PORT", 8050))
     print(f"Starting agy-argon-bridge on 127.0.0.1:{port} (Project: {PROJECT_ID})...")
-    uvicorn.run(app, host="127.0.0.1", port=port, timeout_keep_alive=300)
+    uvicorn.run(app, host="127.0.0.1", port=port, timeout_keep_alive=600)
