@@ -23,7 +23,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = "gemini-4-argon"
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 last_response = None
 
 @asynccontextmanager
@@ -67,23 +67,31 @@ LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
 TIMEOUT_MS = int(os.environ.get("ARGON_BRIDGE_TIMEOUT_MS", 1200000))  # 默认 20 分钟 (1,200,000 ms)
 
-# 初始化 Vertex AI 客户端，使用本机 gcloud ADC 凭据
+# 初始化 Vertex AI 客户端，使用本机 gcloud ADC 凭据并启用 HTTP/2 多路复用
 client = genai.Client(
     vertexai=True,
     project=PROJECT_ID,
     location=LOCATION,
-    http_options=types.HttpOptions(timeout=TIMEOUT_MS),
+    http_options=types.HttpOptions(
+        timeout=TIMEOUT_MS,
+        async_client_args={"http2": True},
+        client_args={"http2": True},
+    ),
 )
 
 def is_retryable_error(exc: Exception) -> bool:
-    """判断异常是否为可重试的临时性限流或云端超时错误 (429, 503, 504, Timeout)"""
+    """判断异常是否为可重试的临时性限流或云端超时/网络断连错误 (429, 503, 504, Timeout, Server disconnected)"""
     code = getattr(exc, "code", None)
     if code in (429, 503, 504):
         return True
-    if isinstance(exc, (httpx.TimeoutException, TimeoutError, httpx.NetworkError)):
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError, httpx.NetworkError, httpx.RemoteProtocolError)):
         return True
     err_msg = str(exc).upper()
-    if any(kw in err_msg for kw in ("RESOURCE_EXHAUSTED", "429", "TOO MANY REQUESTS", "DEADLINE_EXCEEDED", "UNAVAILABLE", "TIMEOUT")):
+    if any(kw in err_msg for kw in (
+        "RESOURCE_EXHAUSTED", "429", "TOO MANY REQUESTS", "DEADLINE_EXCEEDED",
+        "UNAVAILABLE", "TIMEOUT", "SERVER DISCONNECTED", "CONNECTION CLOSED",
+        "PEER CLOSED", "INCOMPLETE CHUNKED READ"
+    )):
         return True
     return False
 
@@ -166,6 +174,67 @@ def sanitize_chunk(obj):
     else:
         return obj
 
+def sanitize_conversation_history(raw_contents: list) -> list:
+    """
+    清洗对话上下文历史，防止死循环和畸形数据导致 Vertex AI 掐断连接：
+    1. 剔除 agy Go 校验引擎注入的错误重试消息（如 model output error...）
+    2. 剔除没有任何实质内容或只有空字符串的 model 轮次
+    3. 为仅含 thinking 的历史 model 轮次填充兜底文本，避免被 Vertex AI 判定为空轮次
+    4. 严格合并连续相同角色的轮次（Vertex AI 要求严格轮流）
+    5. 确保历史以 user 轮次开头
+    """
+    if not raw_contents:
+        return []
+
+    cleaned = []
+    for c in raw_contents:
+        if not isinstance(c, dict):
+            continue
+        role = c.get("role", "user")
+        parts = c.get("parts")
+        if not isinstance(parts, list):
+            continue
+
+        valid_parts = []
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+
+            text = p.get("text")
+            if isinstance(text, str):
+                # 过滤 agy 校验报错注入
+                if "model output must contain either output text or tool calls" in text:
+                    continue
+                # 忽略仅为空白字符串的空 text part
+                if not text.strip() and not p.get("thought") and len(parts) == 1 and role == "model":
+                    continue
+
+            if any(k in p for k in ("functionCall", "functionResponse", "inlineData", "text")):
+                valid_parts.append(p)
+
+        if not valid_parts:
+            continue
+
+        # 如果历史 model 轮次仅含 thought，没有 text 也没有 functionCall，增加占位符防止服务端拒绝
+        if role == "model" and not any("functionCall" in p or (p.get("text") and not p.get("thought")) for p in valid_parts):
+            valid_parts.append({"text": "[Step executed]"})
+
+        # 合并连续相同角色的轮次
+        if cleaned and cleaned[-1].get("role") == role:
+            cleaned[-1]["parts"].extend(valid_parts)
+        else:
+            cleaned.append({"role": role, "parts": valid_parts})
+
+    # 确保以 user 轮次开头
+    while cleaned and cleaned[0].get("role") != "user":
+        cleaned.pop(0)
+
+    # 关键保证：请求末尾必须是 user 轮次，若为 model 轮次则追加继续指令，防止 Vertex AI 报 400
+    if cleaned and cleaned[-1].get("role") == "model":
+        cleaned.append({"role": "user", "parts": [{"text": "Please continue the task."}]})
+
+    return cleaned
+
 @app.get("/healthz")
 async def healthz():
     return {
@@ -245,8 +314,6 @@ def build_config(body: dict, model: str = TARGET_MODEL) -> types.GenerateContent
             cfg.thinking_config.thinking_budget = None
             if cfg.thinking_config.thinking_level == "MINIMAL":
                 cfg.thinking_config.thinking_level = "LOW"
-        # 彻底解除客户端可能下发的截断限制，完全释放 Argon 原生 100 万长解码能力
-        cfg.max_output_tokens = None
         cfg.temperature = cfg.top_p = cfg.top_k = None
     return cfg
 
@@ -286,9 +353,12 @@ async def handle_model_request(model_path: str, request: Request):
     body = await request.json()
     raw_contents = body.get("contents", [])
     
+    # 核心净化：剔除此前死循环产生的报错噪音与空轮次，修复结构严格符合 Vertex AI 规范
+    clean_contents = sanitize_conversation_history(raw_contents)
+
     # 解析对话历史与工具响应结果
     parsed_contents = []
-    for c in raw_contents:
+    for c in clean_contents:
         try:
             parsed_contents.append(types.Content.model_validate(c))
         except Exception:
@@ -298,7 +368,7 @@ async def handle_model_request(model_path: str, request: Request):
     print(f"\n==================== [AGY REQUEST] ====================")
     print(f"Path: {model_path}")
     print(f"Has Local Tools: {has_tools} (Declarations count: {len(body.get('tools', []))})")
-    print(f"Contents count: {len(parsed_contents)}")
+    print(f"Contents count: raw={len(raw_contents)} -> sanitized={len(parsed_contents)}")
     print(f"Routing -> Google Cloud Vertex AI ({upstream_model})", flush=True)
     print(f"=======================================================\n")
 
@@ -326,48 +396,68 @@ async def handle_model_request(model_path: str, request: Request):
 
     # 2. 处理流式输出 (流式返回并实施 Base64 清洗、429 指数退避与 SSE 注释保活)
     if is_stream:
+        max_retries = 6
+        delays = [10, 15, 20, 30, 45, 60]  # 阶梯退避宽限长达 3 分钟，彻底消化 GCP 60s TPM 限流窗口
+        response_stream = None
+        first_chunk = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                response_stream = await client.aio.models.generate_content_stream(
+                    model=upstream_model, contents=parsed_contents, config=cfg,
+                )
+                first_chunk = await anext(response_stream)
+                break
+            except Exception as e:
+                if is_retryable_error(e) and attempt < max_retries:
+                    wait_sec = delays[min(attempt, len(delays) - 1)]
+                    print(f"\n[RATE_LIMIT_GUARD] Upstream {upstream_model} hit rate limit / temporary error: {e}", flush=True)
+                    print(f"[RATE_LIMIT_GUARD] Entering silent automatic backoff: waiting {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
+                    await asyncio.sleep(wait_sec)
+                else:
+                    return upstream_error(e)
+
         async def event_generator():
-            max_retries = 6
-            delays = [10, 15, 20, 30, 45, 60]  # 阶梯退避宽限长达 3 分钟，彻底消化 GCP 60s TPM 限流窗口
-            response_stream = None
-            first_chunk = None
+            has_emitted_content = False
+            try:
+                first_dict = response_dict(first_chunk, requested_model, upstream_model)
+                for cand in first_dict.get("candidates", []):
+                    for p in cand.get("content", {}).get("parts", []):
+                        if (p.get("text") and not p.get("thought")) or "functionCall" in p:
+                            has_emitted_content = True
+                yield f"data: {json.dumps(first_dict)}\n\n"
 
-            for attempt in range(max_retries + 1):
-                try:
-                    response_stream = await client.aio.models.generate_content_stream(
-                        model=upstream_model, contents=parsed_contents, config=cfg,
-                    )
-                    first_chunk = await anext(response_stream)
-                    break
-                except Exception as e:
-                    if is_retryable_error(e) and attempt < max_retries:
-                        wait_sec = delays[min(attempt, len(delays) - 1)]
-                        print(f"\n[RATE_LIMIT_GUARD] Upstream {upstream_model} hit rate limit / temporary error: {e}", flush=True)
-                        print(f"[RATE_LIMIT_GUARD] Entering silent automatic backoff: waiting {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
-                        # agy 的 iterateResponseStream 仅接受 'data: ' 前缀，不可发送 ':' 注释行。静默等待完全受 20 分钟长超时保护。
-                        await asyncio.sleep(wait_sec)
-                    else:
-                        print(f"Streaming error on {upstream_model}: {e}", file=sys.stderr, flush=True)
-                        err_code = getattr(e, "code", 500)
-                        if not isinstance(err_code, int) or not 400 <= err_code <= 599:
-                            err_code = 502
-                        err_dict = {"error": {"message": str(e), "code": err_code}}
-                        yield f"data: {json.dumps(err_dict)}\n\n"
-                        return
-
-            if response_stream and first_chunk:
-                try:
-                    first_dict = response_dict(first_chunk, requested_model, upstream_model)
-                    yield f"data: {json.dumps(first_dict)}\n\n"
-                    async for chunk in response_stream:
-                        chunk_dict = response_dict(chunk, requested_model, upstream_model)
-                        yield f"data: {json.dumps(chunk_dict)}\n\n"
-                except Exception as e:
-                    print(f"Streaming error during stream iteration on {upstream_model}: {e}", file=sys.stderr, flush=True)
+                async for chunk in response_stream:
+                    chunk_dict = response_dict(chunk, requested_model, upstream_model)
+                    for cand in chunk_dict.get("candidates", []):
+                        for p in cand.get("content", {}).get("parts", []):
+                            if (p.get("text") and not p.get("thought")) or "functionCall" in p:
+                                has_emitted_content = True
+                    yield f"data: {json.dumps(chunk_dict)}\n\n"
+            except Exception as e:
+                print(f"Streaming error during stream iteration on {upstream_model}: {e}", file=sys.stderr, flush=True)
+                if not has_emitted_content:
+                    fallback_dict = {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "role": "model",
+                                    "parts": [
+                                        {
+                                            "text": "⚠️ [流式传输因网络抖动中断，已保留当前思考进度。请在终端重新输入指令继续]"
+                                        }
+                                    ],
+                                },
+                                "finishReason": "STOP",
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(fallback_dict)}\n\n"
+                else:
                     err_dict = {"error": {"message": str(e), "code": 500}}
                     yield f"data: {json.dumps(err_dict)}\n\n"
-                finally:
-                    await response_stream.aclose()
+            finally:
+                await response_stream.aclose()
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
