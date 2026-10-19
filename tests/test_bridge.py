@@ -119,6 +119,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(sanitized2[1]["role"], "model")
         self.assertEqual(sanitized2[2]["role"], "user")
 
+    def test_is_retryable_error_handles_h2_closed_state(self):
+        err = RuntimeError("Invalid input ConnectionInputs.RECV_PING in state ConnectionState.CLOSED")
+        self.assertTrue(bridge.is_retryable_error(err))
+
     def test_no_author_project_fallback(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(bridge.subprocess, "run", side_effect=FileNotFoundError), \
              patch.object(bridge.google.auth, "default", return_value=(SimpleNamespace(quota_project_id=None), None)):

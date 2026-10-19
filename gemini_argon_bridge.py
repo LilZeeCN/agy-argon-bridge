@@ -23,8 +23,14 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = "gemini-4-argon"
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 last_response = None
+
+try:
+    import h2.exceptions
+    H2_EXCEPTIONS = (h2.exceptions.H2Error,)
+except ImportError:
+    H2_EXCEPTIONS = ()
 
 @asynccontextmanager
 async def lifespan(app):
@@ -67,29 +73,41 @@ LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
 TIMEOUT_MS = int(os.environ.get("ARGON_BRIDGE_TIMEOUT_MS", 1200000))  # 默认 20 分钟 (1,200,000 ms)
 
-# 初始化 Vertex AI 客户端，使用本机 gcloud ADC 凭据并启用 HTTP/2 多路复用
-client = genai.Client(
-    vertexai=True,
-    project=PROJECT_ID,
-    location=LOCATION,
-    http_options=types.HttpOptions(
-        timeout=TIMEOUT_MS,
-        async_client_args={"http2": True},
-        client_args={"http2": True},
-    ),
-)
+def create_genai_client():
+    return genai.Client(
+        vertexai=True,
+        project=PROJECT_ID,
+        location=LOCATION,
+        http_options=types.HttpOptions(
+            timeout=TIMEOUT_MS,
+            async_client_args={"http2": True},
+            client_args={"http2": True},
+        ),
+    )
+
+client = create_genai_client()
+
+async def reset_client():
+    """在底层 HTTP/2 连接损坏（如长时间运行后连接被远端关闭）时安全重置客户端连接池"""
+    global client
+    try:
+        await client.aio.aclose()
+    except Exception:
+        pass
+    client = create_genai_client()
 
 def is_retryable_error(exc: Exception) -> bool:
-    """判断异常是否为可重试的临时性限流或云端超时/网络断连错误 (429, 503, 504, Timeout, Server disconnected)"""
+    """判断异常是否为可重试的临时性限流、云端超时、断网或底层 HTTP/2 状态机断连错误"""
     code = getattr(exc, "code", None)
     if code in (429, 503, 504):
         return True
-    if isinstance(exc, (httpx.TimeoutException, TimeoutError, httpx.NetworkError, httpx.RemoteProtocolError)):
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError, httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProtocolError, *H2_EXCEPTIONS)):
         return True
     err_msg = str(exc).upper()
     if any(kw in err_msg for kw in (
         "RESOURCE_EXHAUSTED", "429", "TOO MANY REQUESTS", "DEADLINE_EXCEEDED",
         "UNAVAILABLE", "TIMEOUT", "SERVER DISCONNECTED", "CONNECTION CLOSED",
+        "CONNECTIONSTATE", "RECV_PING", "STREAM_CLOSED", "GOAWAY", "H2", "PROTOCOLERROR",
         "PEER CLOSED", "INCOMPLETE CHUNKED READ"
     )):
         return True
@@ -103,8 +121,9 @@ async def execute_with_backoff(func, *args, max_retries=5, **kwargs):
             return await func(*args, **kwargs)
         except Exception as e:
             if is_retryable_error(e) and attempt < max_retries:
+                await reset_client()
                 wait_sec = delays[min(attempt, len(delays) - 1)]
-                print(f"[RATE_LIMIT_GUARD] Transient error {e}. Backoff {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
+                print(f"[RATE_LIMIT_GUARD] Transient error {e}. Reset client connection pool and backoff {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
                 await asyncio.sleep(wait_sec)
             else:
                 raise
@@ -459,9 +478,10 @@ async def handle_model_request(model_path: str, request: Request):
                 break
             except Exception as e:
                 if is_retryable_error(e) and attempt < max_retries:
+                    await reset_client()
                     wait_sec = delays[min(attempt, len(delays) - 1)]
                     print(f"\n[RATE_LIMIT_GUARD] Upstream {upstream_model} hit rate limit / temporary error: {e}", flush=True)
-                    print(f"[RATE_LIMIT_GUARD] Entering silent automatic backoff: waiting {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
+                    print(f"[RATE_LIMIT_GUARD] Reset HTTP/2 client connection pool. Entering silent backoff: waiting {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
                     await asyncio.sleep(wait_sec)
                 else:
                     return upstream_error(e)
