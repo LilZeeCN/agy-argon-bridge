@@ -23,7 +23,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = "gemini-4-argon"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 last_response = None
 
 @asynccontextmanager
@@ -178,58 +178,107 @@ def sanitize_conversation_history(raw_contents: list) -> list:
     """
     清洗对话上下文历史，防止死循环和畸形数据导致 Vertex AI 掐断连接：
     1. 剔除 agy Go 校验引擎注入的错误重试消息（如 model output error...）
-    2. 剔除没有任何实质内容或只有空字符串的 model 轮次
-    3. 为仅含 thinking 的历史 model 轮次填充兜底文本，避免被 Vertex AI 判定为空轮次
-    4. 严格合并连续相同角色的轮次（Vertex AI 要求严格轮流）
-    5. 确保历史以 user 轮次开头
+    2. 严格按规范校准角色：functionCall 必须为 model，functionResponse 必须为 user
+    3. 严禁在一个轮次中同时混入 functionCall 和 functionResponse（自动拆分为独立轮次）
+    4. 严格合并连续纯文本轮次，但隔离 functionResponse 与 functionCall，避免破坏协议校验
+    5. 确保历史以 user 轮次开头，以 user 轮次结尾
     """
     if not raw_contents:
         return []
 
-    cleaned = []
+    # 第一阶段：拆解并按 part 正确归类角色
+    normalized_turns = []
     for c in raw_contents:
         if not isinstance(c, dict):
             continue
-        role = c.get("role", "user")
+        original_role = c.get("role", "user")
         parts = c.get("parts")
         if not isinstance(parts, list):
             continue
 
-        valid_parts = []
+        model_parts = []
+        user_parts = []
         for p in parts:
             if not isinstance(p, dict):
                 continue
 
             text = p.get("text")
             if isinstance(text, str):
-                # 过滤 agy 校验报错注入
                 if "model output must contain either output text or tool calls" in text:
                     continue
-                # 忽略仅为空白字符串的空 text part
-                if not text.strip() and not p.get("thought") and len(parts) == 1 and role == "model":
+                if not text.strip() and not p.get("thought") and len(parts) == 1 and original_role == "model":
                     continue
 
-            if any(k in p for k in ("functionCall", "functionResponse", "inlineData", "text")):
-                valid_parts.append(p)
+            if not any(k in p for k in ("functionCall", "functionResponse", "inlineData", "text")):
+                continue
 
-        if not valid_parts:
+            if "functionCall" in p:
+                model_parts.append(p)
+            elif "functionResponse" in p:
+                user_parts.append(p)
+            else:
+                if original_role == "model":
+                    model_parts.append(p)
+                else:
+                    user_parts.append(p)
+
+        if original_role == "model":
+            if model_parts:
+                normalized_turns.append({"role": "model", "parts": model_parts})
+            if user_parts:
+                normalized_turns.append({"role": "user", "parts": user_parts})
+        else:
+            if user_parts:
+                normalized_turns.append({"role": "user", "parts": user_parts})
+            if model_parts:
+                normalized_turns.append({"role": "model", "parts": model_parts})
+
+    if not normalized_turns:
+        return []
+
+    # 第二阶段：严格轮流与安全合并
+    cleaned = []
+    for turn in normalized_turns:
+        role = turn["role"]
+        parts = turn["parts"]
+
+        if role == "model" and not any("functionCall" in p or (p.get("text") and not p.get("thought")) for p in parts):
+            parts.append({"text": "[Step executed]"})
+
+        if not cleaned:
+            cleaned.append({"role": role, "parts": parts})
             continue
 
-        # 如果历史 model 轮次仅含 thought，没有 text 也没有 functionCall，增加占位符防止服务端拒绝
-        if role == "model" and not any("functionCall" in p or (p.get("text") and not p.get("thought")) for p in valid_parts):
-            valid_parts.append({"text": "[Step executed]"})
+        prev_role = cleaned[-1]["role"]
+        if prev_role == role:
+            prev_has_fc = any("functionCall" in p for p in cleaned[-1]["parts"])
+            curr_has_fc = any("functionCall" in p for p in parts)
+            prev_has_fr = any("functionResponse" in p for p in cleaned[-1]["parts"])
+            curr_has_fr = any("functionResponse" in p for p in parts)
 
-        # 合并连续相同角色的轮次
-        if cleaned and cleaned[-1].get("role") == role:
-            cleaned[-1]["parts"].extend(valid_parts)
+            can_merge = False
+            if role == "model" and not prev_has_fr and not curr_has_fr:
+                can_merge = True
+            elif role == "user" and not prev_has_fc and not curr_has_fc:
+                if not prev_has_fr and not curr_has_fr:
+                    can_merge = True
+                elif prev_has_fr and curr_has_fr:
+                    can_merge = True
+
+            if can_merge:
+                cleaned[-1]["parts"].extend(parts)
+            else:
+                if role == "user":
+                    cleaned.append({"role": "model", "parts": [{"text": "[Acknowledged]"}]})
+                else:
+                    cleaned.append({"role": "user", "parts": [{"text": "Continue"}]})
+                cleaned.append({"role": role, "parts": parts})
         else:
-            cleaned.append({"role": role, "parts": valid_parts})
+            cleaned.append({"role": role, "parts": parts})
 
-    # 确保以 user 轮次开头
     while cleaned and cleaned[0].get("role") != "user":
         cleaned.pop(0)
 
-    # 关键保证：请求末尾必须是 user 轮次，若为 model 轮次则追加继续指令，防止 Vertex AI 报 400
     if cleaned and cleaned[-1].get("role") == "model":
         cleaned.append({"role": "user", "parts": [{"text": "Please continue the task."}]})
 

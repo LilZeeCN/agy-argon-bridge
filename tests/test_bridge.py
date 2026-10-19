@@ -90,6 +90,35 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(bridge.response_dict(response, "fixture-image", "fixture-image")
                          ["candidates"][0]["content"]["parts"][1]["functionCall"]["args"]["data"], "keep-me_-")
 
+    def test_sanitize_isolates_function_call_and_response(self):
+        # 1. 模拟工具调用与响应混杂在同一轮次中（Vertex AI 400 核心诱因）
+        raw_mixed = [
+            {"role": "user", "parts": [{"text": "query"}]},
+            {"role": "model", "parts": [
+                {"functionCall": {"name": "view_file", "args": {"path": "a.py"}}},
+                {"functionResponse": {"name": "view_file", "response": {"content": "code"}}}
+            ]}
+        ]
+        sanitized = bridge.sanitize_conversation_history(raw_mixed)
+        for turn in sanitized:
+            has_fc = any("functionCall" in p for p in turn["parts"])
+            has_fr = any("functionResponse" in p for p in turn["parts"])
+            self.assertFalse(has_fc and has_fr, f"Turn cannot mix functionCall and functionResponse: {turn}")
+
+        # 2. 模拟连续相同 role 被打错导致的混淆合并
+        raw_consecutive = [
+            {"role": "user", "parts": [{"text": "hi"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "test"}}]},
+            {"role": "model", "parts": [{"functionResponse": {"name": "test"}}]}
+        ]
+        sanitized2 = bridge.sanitize_conversation_history(raw_consecutive)
+        for turn in sanitized2:
+            has_fc = any("functionCall" in p for p in turn["parts"])
+            has_fr = any("functionResponse" in p for p in turn["parts"])
+            self.assertFalse(has_fc and has_fr, f"Consecutive turns merged illegal parts: {turn}")
+        self.assertEqual(sanitized2[1]["role"], "model")
+        self.assertEqual(sanitized2[2]["role"], "user")
+
     def test_no_author_project_fallback(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(bridge.subprocess, "run", side_effect=FileNotFoundError), \
              patch.object(bridge.google.auth, "default", return_value=(SimpleNamespace(quota_project_id=None), None)):
