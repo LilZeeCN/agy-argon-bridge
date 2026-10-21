@@ -23,7 +23,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = "gemini-4-argon"
-VERSION = "1.3.3"
+VERSION = "1.3.4"
 last_response = None
 
 try:
@@ -474,13 +474,13 @@ async def handle_model_request(model_path: str, request: Request):
                 response_stream = await client.aio.models.generate_content_stream(
                     model=upstream_model, contents=parsed_contents, config=cfg,
                 )
-                first_chunk = await asyncio.wait_for(anext(response_stream), timeout=60.0)
+                first_chunk = await asyncio.wait_for(anext(response_stream), timeout=240.0)
                 break
             except Exception as e:
                 if is_retryable_error(e) and attempt < max_retries:
                     await reset_client()
                     wait_sec = delays[min(attempt, len(delays) - 1)]
-                    print(f"\n[RATE_LIMIT_GUARD] Upstream {upstream_model} hit rate limit / temporary error: {e}", flush=True)
+                    print(f"\n[RATE_LIMIT_GUARD] Upstream {upstream_model} hit rate limit / temporary error: {type(e).__name__} ({e})", flush=True)
                     print(f"[RATE_LIMIT_GUARD] Reset HTTP/2 client connection pool. Entering silent backoff: waiting {wait_sec}s (retry {attempt + 1}/{max_retries})...", flush=True)
                     await asyncio.sleep(wait_sec)
                 else:
