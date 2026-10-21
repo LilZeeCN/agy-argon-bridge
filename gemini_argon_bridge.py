@@ -23,7 +23,7 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = "gemini-4-argon"
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 last_response = None
 
 try:
@@ -474,7 +474,7 @@ async def handle_model_request(model_path: str, request: Request):
                 response_stream = await client.aio.models.generate_content_stream(
                     model=upstream_model, contents=parsed_contents, config=cfg,
                 )
-                first_chunk = await anext(response_stream)
+                first_chunk = await asyncio.wait_for(anext(response_stream), timeout=60.0)
                 break
             except Exception as e:
                 if is_retryable_error(e) and attempt < max_retries:
