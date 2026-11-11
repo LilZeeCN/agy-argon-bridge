@@ -30,9 +30,7 @@ FALLBACK_MODEL = os.environ.get(
     "ARGON_BRIDGE_FALLBACK_MODEL",
     "gemini-4-argon" if TARGET_MODEL == "gemini-4-carbon" else "gemini-4-carbon",
 )
-AUTO_COMPACT_CHAR_LIMIT = int(os.environ.get("ARGON_AUTO_COMPACT_CHAR_LIMIT", 180000))  # 约 4.5w~6w tokens 触发瘦身
-AUTO_COMPACT_RECENT_TURNS = int(os.environ.get("ARGON_AUTO_COMPACT_RECENT_TURNS", 12))
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 last_response = None
 
 try:
@@ -626,85 +624,7 @@ def sanitize_conversation_history(raw_contents: list) -> list:
     if cleaned and cleaned[-1].get("role") == "model":
         cleaned.append({"role": "user", "parts": [{"text": "Please continue the task."}]})
 
-    return auto_compact_contents(cleaned)
-
-
-def _compact_string_payload(val, max_len=800):
-    if isinstance(val, str) and len(val) > max_len:
-        return (
-            val[:max_len]
-            + f"\n... [BRIDGE_AUTO_COMPACT: truncated {len(val) - max_len} chars from old turn to save tokens & prevent 429] ..."
-        )
-    elif isinstance(val, dict):
-        return {k: _compact_string_payload(v, max_len) for k, v in val.items()}
-    elif isinstance(val, list):
-        if len(val) > 20:
-            return [_compact_string_payload(x, max_len) for x in val[:20]] + [
-                f"... [{len(val) - 20} items omitted by bridge auto-compact]"
-            ]
-        return [_compact_string_payload(x, max_len) for x in val]
-    return val
-
-
-def auto_compact_contents(turns: list) -> list:
-    """
-    桥接层无损协议 Auto-Compact（滑动窗口自动瘦身）：
-    - 当总序列化字符数超过 AUTO_COMPACT_CHAR_LIMIT（默认 180,000 字符，约 5w~6w tokens）且轮数较多时自动触发。
-    - 永远完整保留开头前 2 轮（用户的初始任务目标与上下文摘要）和最近 AUTO_COMPACT_RECENT_TURNS 轮（默认最近 12 轮）。
-    - 对中间陈旧历史轮次中的超长 functionResponse（如大文件读取、长终端输出）及超长文本进行智能折叠，
-      100% 保持 functionCall 与 functionResponse 的配对结构和角色顺序，彻底杜绝 30w Token 膨胀导致的 429 与高额计费。
-    """
-    if not turns or len(turns) <= AUTO_COMPACT_RECENT_TURNS + 2:
-        return turns
-    try:
-        raw_size = len(json.dumps(turns, ensure_ascii=False))
-    except Exception:
-        return turns
-
-    if raw_size <= AUTO_COMPACT_CHAR_LIMIT:
-        return turns
-
-    cutoff = len(turns) - AUTO_COMPACT_RECENT_TURNS
-    compacted_turns = []
-    for idx, turn in enumerate(turns):
-        if idx < 2 or idx >= cutoff:
-            compacted_turns.append(turn)
-            continue
-
-        new_parts = []
-        for p in turn.get("parts", []):
-            if not isinstance(p, dict):
-                new_parts.append(p)
-                continue
-            if "functionResponse" in p and isinstance(p["functionResponse"], dict):
-                fr = dict(p["functionResponse"])
-                fr["response"] = _compact_string_payload(fr.get("response", {}), max_len=600)
-                new_parts.append({**p, "functionResponse": fr})
-            elif "functionCall" in p and isinstance(p["functionCall"], dict):
-                fc = dict(p["functionCall"])
-                fc["args"] = _compact_string_payload(fc.get("args", {}), max_len=600)
-                new_parts.append({**p, "functionCall": fc})
-            elif "text" in p and isinstance(p["text"], str) and len(p["text"]) > 1000:
-                if p.get("thought"):
-                    # 陈旧轮次的思考文本但若带有 thoughtSignature 则保留签名，仅缩短文本
-                    new_parts.append({**p, "text": p["text"][:300] + " ... [old thought compacted]"})
-                else:
-                    new_parts.append({**p, "text": _compact_string_payload(p["text"], max_len=1000)})
-            else:
-                new_parts.append(p)
-        compacted_turns.append({"role": turn["role"], "parts": new_parts})
-
-    try:
-        new_size = len(json.dumps(compacted_turns, ensure_ascii=False))
-        if new_size < raw_size:
-            print(
-                f"[BRIDGE_AUTO_COMPACT] Compacted middle turns (2..{cutoff - 1}): "
-                f"{raw_size:,} chars -> {new_size:,} chars (saved {(1 - new_size / raw_size) * 100:.1f}%)",
-                flush=True,
-            )
-    except Exception:
-        pass
-    return compacted_turns
+    return cleaned
 
 
 @app.get("/healthz")
