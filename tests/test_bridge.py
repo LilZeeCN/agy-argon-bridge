@@ -198,5 +198,15 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mgr.active_email, "acc2@test.com")
         self.assertGreaterEqual(mgr.accounts[0]["used_usd"], 285.0)
 
+    def test_auto_compact_contents_preserves_turns_and_reduces_size(self):
+        turns = [{"role": "user", "parts": [{"text": "Initial goal"}]}]
+        for i in range(18):
+            turns.append({"role": "model", "parts": [{"functionCall": {"name": "read_file", "args": {"path": f"f{i}.py"}}}]})
+            turns.append({"role": "user", "parts": [{"functionResponse": {"name": "read_file", "response": {"content": "X" * 20000}}}]})
+        compacted = bridge.auto_compact_contents(turns)
+        self.assertEqual(len(compacted), len(turns))
+        self.assertIn("BRIDGE_AUTO_COMPACT", compacted[4]["parts"][0]["functionResponse"]["response"]["content"])
+        self.assertEqual(len(compacted[-1]["parts"][0]["functionResponse"]["response"]["content"]), 20000)
+
 if __name__ == "__main__":
     unittest.main()

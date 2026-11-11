@@ -26,7 +26,13 @@ from google.genai import types
 from pydantic import ValidationError
 
 TARGET_MODEL = os.environ.get("ARGON_BRIDGE_TARGET_MODEL") or os.environ.get("TARGET_MODEL") or "gemini-4-carbon"
-VERSION = "1.4.0"
+FALLBACK_MODEL = os.environ.get(
+    "ARGON_BRIDGE_FALLBACK_MODEL",
+    "gemini-4-argon" if TARGET_MODEL == "gemini-4-carbon" else "gemini-4-carbon",
+)
+AUTO_COMPACT_CHAR_LIMIT = int(os.environ.get("ARGON_AUTO_COMPACT_CHAR_LIMIT", 180000))  # 约 4.5w~6w tokens 触发瘦身
+AUTO_COMPACT_RECENT_TURNS = int(os.environ.get("ARGON_AUTO_COMPACT_RECENT_TURNS", 12))
+VERSION = "1.5.0"
 last_response = None
 
 try:
@@ -379,6 +385,27 @@ def _get_dispatch_targets():
     return [(None, PROJECT_ID, client)]
 
 
+def _get_dispatch_routes(upstream_model: str):
+    """
+    构建（账号 + 模型）多维高可用路由表：
+    1. 优先尝试所有可用账号的 primary model（如 gemini-4-carbon）。
+    2. 当单账号或全池在 primary model 上触发 429 限流时，无缝切换至同账号的独立配额池 FALLBACK_MODEL（如 gemini-4-argon），实现单号双倍并发/TPM 容量！
+    """
+    base_targets = _get_dispatch_targets()
+    if client is not _default_client:
+        return [(email, proj, c, upstream_model) for email, proj, c in base_targets]
+
+    models = [upstream_model]
+    if upstream_model in ("gemini-4-carbon", "gemini-4-argon") and FALLBACK_MODEL and FALLBACK_MODEL != upstream_model:
+        models.append(FALLBACK_MODEL)
+
+    routes = []
+    for m in models:
+        for email, proj, c in base_targets:
+            routes.append((email, proj, c, m))
+    return routes
+
+
 def is_retryable_error(exc: Exception) -> bool:
     """判断异常是否为可重试的临时性限流、云端超时、断网或底层 HTTP/2 状态机断连错误"""
     code = getattr(exc, "code", None)
@@ -397,33 +424,35 @@ def is_retryable_error(exc: Exception) -> bool:
     return False
 
 
-async def execute_with_pool_backoff(method_name: str, *args, max_retries=5, **kwargs):
-    """支持多账号 429 自动故障转移与 HTTP/2 连接池重置指数退避的异步调用器"""
-    delays = [5, 10, 15, 25, 40]
-    targets = _get_dispatch_targets()
+async def execute_with_pool_backoff(method_name: str, *args, max_retries=8, **kwargs):
+    """支持多账号 + 双旗舰模型 (Carbon/Argon) 429 零等待故障转移与 HTTP/2 连接池重置指数退避的异步调用器"""
+    delays = [5, 10, 15, 25, 40, 60, 60, 60]
+    requested_up_model = kwargs.get("model", TARGET_MODEL)
+    routes = _get_dispatch_routes(requested_up_model)
 
     for attempt in range(max_retries + 1):
-        target_idx = min(attempt, len(targets) - 1)
-        acc_email, acc_proj, target_client = targets[target_idx]
+        route_idx = min(attempt, len(routes) - 1)
+        acc_email, acc_proj, target_client, route_model = routes[route_idx]
+        call_kwargs = dict(kwargs, model=route_model)
         func = getattr(target_client.aio.models, method_name)
         try:
-            res = await func(*args, **kwargs)
-            return res, acc_email, acc_proj
+            res = await func(*args, **call_kwargs)
+            return res, acc_email, acc_proj, route_model
         except Exception as e:
             if is_retryable_error(e) and attempt < max_retries:
-                if attempt + 1 < len(targets):
-                    next_email, next_proj, _ = targets[attempt + 1]
+                if attempt + 1 < len(routes):
+                    next_email, next_proj, _, next_model = routes[attempt + 1]
                     print(
-                        f"[POOL_FAILOVER] {acc_email} hit 429/transient error. "
-                        f"Instantly failing over to {next_email} ({next_proj})...",
+                        f"[POOL_FAILOVER] {acc_email} ({route_model}) hit 429/transient error. "
+                        f"Instantly switching to {next_email} ({next_proj} / {next_model})...",
                         flush=True,
                     )
                     continue
                 await reset_client(acc_email)
-                targets = _get_dispatch_targets()
+                routes = _get_dispatch_routes(requested_up_model)
                 wait_sec = delays[min(attempt, len(delays) - 1)]
                 print(
-                    f"[RATE_LIMIT_GUARD] Transient error on {acc_email or acc_proj}: {e}. "
+                    f"[RATE_LIMIT_GUARD] Transient error on {acc_email or acc_proj} ({route_model}): {e}. "
                     f"Reset connection pool and backoff {wait_sec}s (retry {attempt + 1}/{max_retries})...",
                     flush=True,
                 )
@@ -597,7 +626,85 @@ def sanitize_conversation_history(raw_contents: list) -> list:
     if cleaned and cleaned[-1].get("role") == "model":
         cleaned.append({"role": "user", "parts": [{"text": "Please continue the task."}]})
 
-    return cleaned
+    return auto_compact_contents(cleaned)
+
+
+def _compact_string_payload(val, max_len=800):
+    if isinstance(val, str) and len(val) > max_len:
+        return (
+            val[:max_len]
+            + f"\n... [BRIDGE_AUTO_COMPACT: truncated {len(val) - max_len} chars from old turn to save tokens & prevent 429] ..."
+        )
+    elif isinstance(val, dict):
+        return {k: _compact_string_payload(v, max_len) for k, v in val.items()}
+    elif isinstance(val, list):
+        if len(val) > 20:
+            return [_compact_string_payload(x, max_len) for x in val[:20]] + [
+                f"... [{len(val) - 20} items omitted by bridge auto-compact]"
+            ]
+        return [_compact_string_payload(x, max_len) for x in val]
+    return val
+
+
+def auto_compact_contents(turns: list) -> list:
+    """
+    桥接层无损协议 Auto-Compact（滑动窗口自动瘦身）：
+    - 当总序列化字符数超过 AUTO_COMPACT_CHAR_LIMIT（默认 180,000 字符，约 5w~6w tokens）且轮数较多时自动触发。
+    - 永远完整保留开头前 2 轮（用户的初始任务目标与上下文摘要）和最近 AUTO_COMPACT_RECENT_TURNS 轮（默认最近 12 轮）。
+    - 对中间陈旧历史轮次中的超长 functionResponse（如大文件读取、长终端输出）及超长文本进行智能折叠，
+      100% 保持 functionCall 与 functionResponse 的配对结构和角色顺序，彻底杜绝 30w Token 膨胀导致的 429 与高额计费。
+    """
+    if not turns or len(turns) <= AUTO_COMPACT_RECENT_TURNS + 2:
+        return turns
+    try:
+        raw_size = len(json.dumps(turns, ensure_ascii=False))
+    except Exception:
+        return turns
+
+    if raw_size <= AUTO_COMPACT_CHAR_LIMIT:
+        return turns
+
+    cutoff = len(turns) - AUTO_COMPACT_RECENT_TURNS
+    compacted_turns = []
+    for idx, turn in enumerate(turns):
+        if idx < 2 or idx >= cutoff:
+            compacted_turns.append(turn)
+            continue
+
+        new_parts = []
+        for p in turn.get("parts", []):
+            if not isinstance(p, dict):
+                new_parts.append(p)
+                continue
+            if "functionResponse" in p and isinstance(p["functionResponse"], dict):
+                fr = dict(p["functionResponse"])
+                fr["response"] = _compact_string_payload(fr.get("response", {}), max_len=600)
+                new_parts.append({**p, "functionResponse": fr})
+            elif "functionCall" in p and isinstance(p["functionCall"], dict):
+                fc = dict(p["functionCall"])
+                fc["args"] = _compact_string_payload(fc.get("args", {}), max_len=600)
+                new_parts.append({**p, "functionCall": fc})
+            elif "text" in p and isinstance(p["text"], str) and len(p["text"]) > 1000:
+                if p.get("thought"):
+                    # 陈旧轮次的思考文本但若带有 thoughtSignature 则保留签名，仅缩短文本
+                    new_parts.append({**p, "text": p["text"][:300] + " ... [old thought compacted]"})
+                else:
+                    new_parts.append({**p, "text": _compact_string_payload(p["text"], max_len=1000)})
+            else:
+                new_parts.append(p)
+        compacted_turns.append({"role": turn["role"], "parts": new_parts})
+
+    try:
+        new_size = len(json.dumps(compacted_turns, ensure_ascii=False))
+        if new_size < raw_size:
+            print(
+                f"[BRIDGE_AUTO_COMPACT] Compacted middle turns (2..{cutoff - 1}): "
+                f"{raw_size:,} chars -> {new_size:,} chars (saved {(1 - new_size / raw_size) * 100:.1f}%)",
+                flush=True,
+            )
+    except Exception:
+        pass
+    return compacted_turns
 
 
 @app.get("/healthz")
@@ -771,7 +878,7 @@ async def handle_model_request(model_path: str, request: Request):
     # 1. 处理 Token 计算
     if operation == "countTokens":
         try:
-            res, _, _ = await execute_with_pool_backoff(
+            res, _, _, _ = await execute_with_pool_backoff(
                 "count_tokens",
                 model=upstream_model,
                 contents=parsed_contents,
@@ -790,22 +897,23 @@ async def handle_model_request(model_path: str, request: Request):
         return JSONResponse(status_code=400, content={"error": {"message": str(e), "code": 400}})
     is_stream = operation == "streamGenerateContent"
 
-    # 2. 处理流式输出（首帧 240s 超时看门狗、跨账号 429 自动分流、HTTP/2 重连自愈）
+    # 2. 处理流式输出（首帧 240s 超时看门狗、跨账号 + 跨模型 Carbon/Argon 429 自动分流、12 分钟长退避自愈）
     if is_stream:
-        max_retries = 6
-        delays = [10, 15, 20, 30, 45, 60]
+        max_retries = 12
+        delays = [8, 12, 18, 25, 35, 45, 60, 60, 60, 60, 60, 60]
         response_stream = None
         first_chunk = None
         used_email = primary_email
         used_proj = primary_proj
+        used_model = upstream_model
 
         for attempt in range(max_retries + 1):
-            targets = _get_dispatch_targets()
-            target_idx = min(attempt, len(targets) - 1)
-            used_email, used_proj, target_client = targets[target_idx]
+            routes = _get_dispatch_routes(upstream_model)
+            route_idx = attempt % len(routes) if attempt < len(routes) * 2 else min(attempt, len(routes) - 1)
+            used_email, used_proj, target_client, used_model = routes[route_idx]
             try:
                 response_stream = await target_client.aio.models.generate_content_stream(
-                    model=upstream_model,
+                    model=used_model,
                     contents=parsed_contents,
                     config=cfg,
                 )
@@ -815,18 +923,18 @@ async def handle_model_request(model_path: str, request: Request):
                 break
             except Exception as e:
                 if is_retryable_error(e) and attempt < max_retries:
-                    if attempt + 1 < len(targets):
-                        next_email, next_proj, _ = targets[attempt + 1]
+                    if attempt + 1 < len(routes):
+                        next_email, next_proj, _, next_model = routes[attempt + 1]
                         print(
-                            f"\n[POOL_FAILOVER] Upstream {upstream_model} on {used_email} hit 429/transient error. "
-                            f"Instantly switching request to {next_email} ({next_proj})...",
+                            f"\n[POOL_FAILOVER] Upstream {used_model} on {used_email} hit 429/transient error. "
+                            f"Instantly switching request to {next_email} ({next_proj} / model={next_model})...",
                             flush=True,
                         )
                         continue
                     await reset_client(used_email)
-                    wait_sec = delays[min(attempt, len(delays) - 1)]
+                    wait_sec = delays[min(attempt - len(routes) + 1, len(delays) - 1)]
                     print(
-                        f"\n[RATE_LIMIT_GUARD] Upstream {upstream_model} on {used_email} hit rate limit / temporary error: {type(e).__name__} ({e})",
+                        f"\n[RATE_LIMIT_GUARD] Upstream {used_model} on {used_email} hit rate limit / temporary error: {type(e).__name__} ({e})",
                         flush=True,
                     )
                     print(
@@ -835,7 +943,7 @@ async def handle_model_request(model_path: str, request: Request):
                     )
                     await asyncio.sleep(wait_sec)
                 else:
-                    print(f"Streaming error before first chunk on {upstream_model}: {e}", file=sys.stderr, flush=True)
+                    print(f"Streaming error before first chunk on {used_model}: {e}", file=sys.stderr, flush=True)
                     return upstream_error(e)
 
         async def event_generator():
@@ -845,7 +953,7 @@ async def handle_model_request(model_path: str, request: Request):
             try:
                 if first_chunk is not None:
                     first_dict = response_dict(
-                        first_chunk, requested_model, upstream_model, used_email, used_proj
+                        first_chunk, requested_model, used_model, used_email, used_proj
                     )
                     for cand in first_dict.get("candidates", []):
                         for p in cand.get("content", {}).get("parts", []):
@@ -855,7 +963,7 @@ async def handle_model_request(model_path: str, request: Request):
 
                 async for chunk in response_stream:
                     chunk_dict = response_dict(
-                        chunk, requested_model, upstream_model, used_email, used_proj
+                        chunk, requested_model, used_model, used_email, used_proj
                     )
                     for cand in chunk_dict.get("candidates", []):
                         for p in cand.get("content", {}).get("parts", []):
@@ -863,7 +971,7 @@ async def handle_model_request(model_path: str, request: Request):
                                 has_emitted_content = True
                     yield f"data: {json.dumps(chunk_dict)}\n\n"
             except Exception as e:
-                print(f"Streaming error during stream iteration on {upstream_model}: {e}", file=sys.stderr, flush=True)
+                print(f"Streaming error during stream iteration on {used_model}: {e}", file=sys.stderr, flush=True)
                 if not has_emitted_content:
                     fallback_dict = {
                         "candidates": [
@@ -892,13 +1000,13 @@ async def handle_model_request(model_path: str, request: Request):
     # 3. 处理非流式输出
     else:
         try:
-            resp, used_email, used_proj = await execute_with_pool_backoff(
+            resp, used_email, used_proj, used_model = await execute_with_pool_backoff(
                 "generate_content",
                 model=upstream_model,
                 contents=parsed_contents,
                 config=cfg,
             )
-            resp_dict = response_dict(resp, requested_model, upstream_model, used_email, used_proj)
+            resp_dict = response_dict(resp, requested_model, used_model, used_email, used_proj)
             return JSONResponse(content=resp_dict)
         except Exception as e:
             print(f"GenerateContent error on {upstream_model}: {e}", file=sys.stderr)
