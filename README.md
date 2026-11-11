@@ -2,13 +2,13 @@
 
 # ⚡️ agy-argon-bridge
 
-### 白嫖 Google Cloud $300 赠金 · 畅享 Vertex AI 旗舰 `gemini-4-argon` 本地高可用桥接服务
+### 白嫖 Google Cloud $300 赠金 · 畅享 Vertex AI 旗舰 `gemini-4-carbon` / `gemini-4-argon` 本地高可用桥接服务
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
 [![Vertex AI](https://img.shields.io/badge/Google%20Cloud-Vertex%20AI-orange.svg)](https://cloud.google.com/vertex-ai)
-[![Model: gemini-4-argon](https://img.shields.io/badge/Model-gemini--4--argon-purple.svg)](https://cloud.google.com/vertex-ai)
-[![Version: v1.3.4](https://img.shields.io/badge/Version-1.3.4-brightgreen.svg)](https://github.com/LilZeeCN/agy-argon-bridge)
+[![Model: gemini-4-carbon](https://img.shields.io/badge/Model-gemini--4--carbon-purple.svg)](https://cloud.google.com/vertex-ai)
+[![Version: v1.4.0](https://img.shields.io/badge/Version-1.4.0-brightgreen.svg)](https://github.com/LilZeeCN/agy-argon-bridge)
 
 <br/>
 
@@ -28,9 +28,9 @@
   - [3. 本地安装与配置 Google Cloud CLI (`gcloud`)](#3-本地安装与配置-google-cloud-cli-gcloud)
 - [🚀 30 秒一键安装与运行](#-30-秒一键安装与运行)
 - [🔍 验证真实云端模型返回](#-验证真实云端模型返回)
-- [🎛 灵活切换模型（不仅是 Argon！）](#-灵活切换模型不仅是-argon)
-- [🔄 核心技巧：300$ 赠金用完后如何“一键切号”？](#-核心技巧300-赠金用完后如何一键切号)
-- [🛡️ 稳定性黑科技（v1.3.4 特性）](#️-稳定性黑科技v134-特性)
+- [🎛 灵活切换模型（默认 `gemini-4-carbon`）](#-灵活切换模型不仅是-argon)
+- [🔄 核心技巧：多账号池 $285 安全阈值无感轮转与 429 跨号分流（v1.4.0 新增）](#-核心技巧300-赠金用完后如何一键切号)
+- [🛡️ 稳定性黑科技（v1.4.0 特性）](#️-稳定性黑科技v134-特性)
 - [❓ 常见避坑与 FAQ](#-常见避坑与-faq)
 
 ---
@@ -202,11 +202,12 @@ python3 bin/verify_argon.py
 
 | 推荐模型 | 环境变量设置 | 核心特性与推荐场景 |
 | :--- | :--- | :--- |
-| **`gemini-4-argon`** *(默认)* | `export TARGET_MODEL="gemini-4-argon"` | 旗舰全模态深度思考模型，复杂工程架构重构、难题攻坚首选 |
-| **`gemini-3.7-flash`** | `export TARGET_MODEL="gemini-3.7-flash"` | 最新混合思考极速版，消耗赠金极少，极适合高频日常打字交互 |
-| **`gemini-3.1-pro-preview`** | `export TARGET_MODEL="gemini-3.1-pro-preview"` | 新一代高级推理预览版，逻辑和代码生成能力极强 |
-| **`gemini-2.5-pro`** | `export TARGET_MODEL="gemini-2.5-pro"` | 工业级稳定性，支持 **200 万超大 Token 上下文窗口** |
-| **`gemini-2.5-flash`** | `export TARGET_MODEL="gemini-2.5-flash"` | 极致性价比主力模型，毫秒级响应 |
+| **`gemini-4-carbon`** *(v1.4.0 默认)* | `export ARGON_BRIDGE_TARGET_MODEL="gemini-4-carbon"` | 最新旗舰全模态深度思考模型，支持完整本地工具调用与 `HIGH` 思考强度 |
+| **`gemini-4-argon`** | `export ARGON_BRIDGE_TARGET_MODEL="gemini-4-argon"` | 旗舰全模态深度思考模型，复杂工程架构重构、难题攻坚首选 |
+| **`gemini-3.7-flash`** | `export ARGON_BRIDGE_TARGET_MODEL="gemini-3.7-flash"` | 最新混合思考极速版，消耗赠金极少，极适合高频日常打字交互 |
+| **`gemini-3.1-pro-preview`** | `export ARGON_BRIDGE_TARGET_MODEL="gemini-3.1-pro-preview"` | 新一代高级推理预览版，逻辑和代码生成能力极强 |
+| **`gemini-2.5-pro`** | `export ARGON_BRIDGE_TARGET_MODEL="gemini-2.5-pro"` | 工业级稳定性，支持 **200 万超大 Token 上下文窗口** |
+| **`gemini-2.5-flash`** | `export ARGON_BRIDGE_TARGET_MODEL="gemini-2.5-flash"` | 极致性价比主力模型，毫秒级响应 |
 
 **切换方法：**
 修改 launchd plist 或在启动时声明 `TARGET_MODEL`，并重启服务：
@@ -216,9 +217,53 @@ launchctl kickstart -k gui/$(id -u)/com.antigravity.argon-bridge
 
 ---
 
-## 🔄 核心技巧：300$ 赠金用完后如何“一键切号”？
+## 🔄 核心技巧：300$ 赠金用完后如何“一键切号”？（v1.4.0 支持多账号全自动无感轮转！）
 
-当一个账号的 300$ 赠金用完或 90 天到期后，您可以轻松切换到新账号，继续白嫖 300 刀赠金。**完全不需要重装系统或重配环境，仅需 3 步：**
+### 方式一：配置多账号池 `~/.local/share/agy-argon/accounts_pool.json`（推荐 · 全自动零感切号）
+
+`v1.4.0` 内置了 **`AccountPoolManager` 多账号实时计费与智能轮转引擎**：
+- **本地实时精准计费**：根据每次响应的 `usageMetadata`（按 `responseId` 自动去重计算流式增量）实时核算美元消耗并持久化落盘。
+- **$285 硬性安全熔断（预留 $15 缓冲）**：单账号 $300 赠金一旦消耗达到 `limit_usd`（默认 `$285.00`），桥接器会在 **0.01 秒内自动切换**至池中下一个可用账号；已达上限的账号会被**硬性锁定剔除**，绝不再发起任何请求，确保账单永远为 `US$0.00`。
+- **多子代理 429 跨号秒级分流**：当同时开启 4 个以上子代理（Subagents）触发单账号并发限流（`429 RESOURCE_EXHAUSTED`）时，桥接器无需等待退避，直接将溢出请求无缝转发至池内备用账号，前台 100% 无感。
+- **单账号高并发解锁提示**：新注册的 GCP 试用账号默认处于“免费试用限流档”，在 Cloud Billing 概览页点击 **“升级（激活完整账号）”** 即可在不损失 $300 赠金的前提下解锁正式版动态共享并发配额（DSQ）。
+
+只需在 `~/.local/share/agy-argon/accounts_pool.json` 创建如下配置（可通过 `GET http://127.0.0.1:8050/accounts` 随时查看实时账本）：
+
+```json
+{
+  "safety_buffer_usd": 15.0,
+  "pricing_per_1m_tokens": {
+    "prompt_usd": 2.5,
+    "cached_prompt_usd": 0.5,
+    "output_and_thought_usd": 15.0
+  },
+  "active_account": "your-account-1@example.com",
+  "accounts": [
+    {
+      "email": "your-account-1@example.com",
+      "project_id": "your-gcp-project-1",
+      "credentials_file": "~/.local/share/agy-argon/accounts/adc_account1.json",
+      "total_credit_usd": 300.0,
+      "limit_usd": 285.0,
+      "used_usd": 0.0,
+      "enabled": true
+    },
+    {
+      "email": "your-account-2@example.com",
+      "project_id": "your-gcp-project-2",
+      "credentials_file": "~/.local/share/agy-argon/accounts/adc_account2.json",
+      "total_credit_usd": 300.0,
+      "limit_usd": 285.0,
+      "used_usd": 120.5,
+      "enabled": true
+    }
+  ]
+}
+```
+
+### 方式二：单账号手动切换
+
+如果您只使用单账号模式，当一个账号的 300$ 赠金用完或 90 天到期后，仅需 3 步即可手动切换到新账号：
 
 1. **新账号准备**：
    - 注册新账号并激活 300$ 赠金；

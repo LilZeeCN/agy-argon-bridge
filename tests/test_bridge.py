@@ -147,7 +147,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         health = await asyncio.wait_for(self.http.get("/healthz"), timeout=0.1)
         self.assertEqual(health.status_code, 200)
         self.assertFalse(request.done())
-        self.assertEqual((await request).json()["modelVersion"], "gemini-4-argon")
+        self.assertEqual((await request).json()["modelVersion"], bridge.TARGET_MODEL)
 
     async def test_image_model_and_modalities_are_preserved(self):
         body = {**BODY, "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
@@ -175,13 +175,28 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_contains_real_upstream_version(self):
         response = await self.http.post("/v1beta/models/gemini-3.8-flash:streamGenerateContent", json=BODY)
         self.assertEqual(response.status_code, 200)
-        self.assertIn('"modelVersion": "gemini-4-argon"', response.text)
+        self.assertIn(f'"modelVersion": "{bridge.TARGET_MODEL}"', response.text)
         health = (await self.http.get("/healthz")).json()
         self.assertEqual(health["last_response"]["responseId"], "fixture-response")
 
     async def test_unknown_operation_rejected(self):
         response = await self.http.post("/v1beta/models/gemini-4-argon:notAnOperation", json=BODY)
         self.assertEqual(response.status_code, 404)
+
+    def test_account_pool_auto_rotation_at_285_limit(self):
+        mgr = bridge.AccountPoolManager("/nonexistent/path.json")
+        mgr.accounts = [
+            {"email": "acc1@test.com", "project_id": "proj-1", "limit_usd": 285.0, "used_usd": 284.9, "enabled": True},
+            {"email": "acc2@test.com", "project_id": "proj-2", "limit_usd": 285.0, "used_usd": 10.0, "enabled": True},
+        ]
+        mgr.clients = {"acc1@test.com": object(), "acc2@test.com": object()}
+        mgr.active_email = "acc1@test.com"
+
+        # 产生一笔超过 $0.10 的消耗（如 10,000 输出 tokens = $0.15），触发 285.0 阈值自动切号
+        usage = {"promptTokenCount": 1000, "candidatesTokenCount": 10000}
+        mgr.record_usage("acc1@test.com", "resp-1", usage)
+        self.assertEqual(mgr.active_email, "acc2@test.com")
+        self.assertGreaterEqual(mgr.accounts[0]["used_usd"], 285.0)
 
 if __name__ == "__main__":
     unittest.main()
